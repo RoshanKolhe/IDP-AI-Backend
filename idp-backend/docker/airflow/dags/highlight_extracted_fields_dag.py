@@ -81,6 +81,7 @@ def extract_text_from_pdf(pdf_path):
 
 def highlight_and_upload(**context):
     process_instance_id = context["dag_run"].conf.get("id")
+    is_orchestrated = bool(context["dag_run"].conf.get("orchestrated", False))
     print("highlight_and_upload() function has started.")
     if not process_instance_id:
         raise ValueError("Missing process_instance_id in dag_run.conf")
@@ -269,7 +270,7 @@ def highlight_and_upload(**context):
         print(f"✅ Stored metadata for file with avg score {overall_score}%")
         log_to_mongo(process_instance_id, message = f"Stored metadata for file with avg score {overall_score}%", node_name = "Validation", log_type=2)
 
-    if AUTO_EXECUTE_NEXT_NODE == 1:
+    if AUTO_EXECUTE_NEXT_NODE == 1 and not is_orchestrated:
         token = get_auth_token()
         trigger_url = f"{AIRFLOW_API_URL}/dags/deliver_dag/dagRuns"
         run_id = f"triggered_by_validate_human_{process_instance_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"

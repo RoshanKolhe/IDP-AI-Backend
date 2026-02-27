@@ -266,6 +266,7 @@ def extract_text_per_page(pdf_path, max_pages=10):
 
 def classify_documents(**context):
     process_instance_id = context["dag_run"].conf.get("id")
+    is_orchestrated = bool(context["dag_run"].conf.get("orchestrated", False))
     if not process_instance_id:
         raise ValueError("Missing process_instance_id in dag_run.conf")
 
@@ -429,7 +430,7 @@ def classify_documents(**context):
         conn.commit()
         print("🔕 DocumentType table updated → isActive=0 after classification.")
 
-        if AUTO_EXECUTE_NEXT_NODE == 1:
+        if AUTO_EXECUTE_NEXT_NODE == 1 and not is_orchestrated:
             print("🚀 Triggering extract_documents_dag...")
             token = get_auth_token()
             trigger_url = f"{AIRFLOW_API_URL}/dags/extract_documents_dag/dagRuns"

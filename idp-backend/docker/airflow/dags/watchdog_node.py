@@ -78,15 +78,15 @@ def check_and_trigger_ingestion():
 
         logging.info(f"Found {len(running_instances)} running instances")
 
-        # 3. Trigger ingestion DAG for each instance
+        # 3. Trigger service orchestrator DAG for each instance
         for (instance_id,) in running_instances:
             try:
-                trigger_url = f"{AIRFLOW_API_URL}/dags/ingest_documents_dag/dagRuns"
+                trigger_url = f"{AIRFLOW_API_URL}/dags/idp_service_orchestrator/dagRuns"
                 run_id = f"watchdog_triggered_{instance_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
                 payload = {
                     "dag_run_id": run_id,
                     "logical_date": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),  # Match curl format
-                    "conf": {"id": instance_id}
+                    "conf": {"id": instance_id, "orchestrated": True}
                 }
                 
                 logging.info(f"Triggering DAG with payload: {json.dumps(payload)}")
@@ -110,7 +110,7 @@ def check_and_trigger_ingestion():
                     )
                 
                 response.raise_for_status()
-                logging.info(f"Successfully triggered ingestion for instance {instance_id}")
+                logging.info(f"Successfully triggered orchestrator for instance {instance_id}")
                 
             except requests.exceptions.HTTPError as e:
                 logging.error(f"Failed to trigger DAG for instance {instance_id}: {str(e)}")

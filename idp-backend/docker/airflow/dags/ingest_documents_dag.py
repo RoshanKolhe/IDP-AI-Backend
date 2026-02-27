@@ -99,6 +99,7 @@ def get_auth_token():
 def fetch_blueprint_and_download_docs(**context):
     # Get process instance ID from DAG run configuration
     process_instance_id = context["dag_run"].conf.get("id")
+    is_orchestrated = bool(context["dag_run"].conf.get("orchestrated", False))
     if not process_instance_id:
         raise ValueError("Missing process_instance_id in dag_run.conf")
         log_to_mongo(process_instance_id, message = "Missing process_instance_id in dag_run.conf", node_name = "Ingestion", log_type=1)
@@ -300,7 +301,7 @@ def fetch_blueprint_and_download_docs(**context):
 
 
         # 8. Trigger classify_documents_dag
-        if AUTO_EXECUTE_NEXT_NODE == 1:
+        if AUTO_EXECUTE_NEXT_NODE == 1 and not is_orchestrated:
             print("🚀 Triggering classify_documents_dag...")
             token = get_auth_token()
             trigger_url = f"{AIRFLOW_API_URL}/dags/classify_documents_dag/dagRuns"

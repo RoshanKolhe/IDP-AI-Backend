@@ -245,6 +245,7 @@ def correct_typos_with_genai(extracted_data):
 def extract_fields_from_documents(**context):
     # Get process instance ID from DAG run configuration
     process_instance_id = context["dag_run"].conf.get("id")
+    is_orchestrated = bool(context["dag_run"].conf.get("orchestrated", False))
     if not process_instance_id:
         raise ValueError("Missing process_instance_id in dag_run.conf")
     
@@ -405,7 +406,7 @@ def extract_fields_from_documents(**context):
     log_to_mongo(process_instance_id, message = f"Saved cleaned_extracted_fields.json", node_name = "Extraction", log_type=2)
 
     # Trigger validate_documents_dag
-    if AUTO_EXECUTE_NEXT_NODE == 1:
+    if AUTO_EXECUTE_NEXT_NODE == 1 and not is_orchestrated:
         print("🚀 Triggering validate_fields_dag...")
         token = get_auth_token()
         trigger_url = f"{AIRFLOW_API_URL}/dags/highlight_extracted_fields_dag/dagRuns"
