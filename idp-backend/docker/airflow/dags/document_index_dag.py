@@ -131,6 +131,7 @@ def _invoke_mcp_tool(tool_name, arguments):
 
     last_error = None
     for payload in payload_variants:
+        print("payload on invoke mcp : ", payload)
         try:
             response = requests.post(
                 MCP_ENDPOINT,
@@ -138,6 +139,7 @@ def _invoke_mcp_tool(tool_name, arguments):
                 headers=headers,
                 timeout=MCP_TIMEOUT_SECONDS,
             )
+            print("response on invoke mcp : ", response)
             response.raise_for_status()
             body = response.json()
             if body.get("error"):
