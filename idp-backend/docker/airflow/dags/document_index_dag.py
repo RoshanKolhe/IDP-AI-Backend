@@ -326,6 +326,7 @@ def _upload_documents_via_http(file_paths, process_id, document_type, is_contrac
             timeout=MCP_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
+        print('response of http upload : ', response.json())        
         return response.json()
     finally:
         for file_handle in file_handles:
