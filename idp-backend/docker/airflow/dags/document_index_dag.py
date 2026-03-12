@@ -17,6 +17,13 @@ MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN")
 MCP_TIMEOUT_SECONDS = int(os.getenv("MCP_TIMEOUT_SECONDS", "60"))
 MCP_JSONRPC_METHOD = os.getenv("MCP_JSONRPC_METHOD", "tools/call")
 MCP_PROTOCOL_VERSION = os.getenv("MCP_PROTOCOL_VERSION", "2024-11-05")
+PROCESSING_BASE_URL = os.getenv("PROCESSING_BASE_URL", "http://13.203.33.247:8002")
+DOCUMENT_INDEX_STATUS_POLL_INTERVAL_SECONDS = int(
+    os.getenv("DOCUMENT_INDEX_STATUS_POLL_INTERVAL_SECONDS", "10")
+)
+DOCUMENT_INDEX_STATUS_TIMEOUT_SECONDS = int(
+    os.getenv("DOCUMENT_INDEX_STATUS_TIMEOUT_SECONDS", "900")
+)
 
 MONGO_URI = os.getenv("MONGO_URI")
 mongo_client = MongoClient(MONGO_URI)
@@ -183,6 +190,16 @@ def _initialize_mcp_session():
     return mcp_session_id, body
 
 
+def _get_processing_base_url():
+    if PROCESSING_BASE_URL:
+        return PROCESSING_BASE_URL.rstrip("/")
+
+    endpoint = MCP_ENDPOINT.rstrip("/")
+    if endpoint.endswith("/mcp"):
+        return endpoint[:-4]
+    return endpoint
+
+
 def _invoke_mcp_tool(tool_name, arguments, mcp_session_id):
     headers = {
         "Content-Type": "application/json",
@@ -279,6 +296,89 @@ def _extract_tasks(mcp_response):
     if not isinstance(tasks, list):
         return []
     return [task for task in tasks if isinstance(task, dict)]
+
+
+def _upload_documents_via_http(file_paths, process_id, document_type, is_contract):
+    headers = {}
+    if MCP_AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {MCP_AUTH_TOKEN}"
+
+    data = {
+        "process_id": process_id,
+        "doc_type": document_type,
+        "is_contract": is_contract,
+    }
+
+    upload_url = f"{_get_processing_base_url()}/processing/upload-with-process-id/"
+    file_handles = []
+    try:
+        files = []
+        for file_path in file_paths:
+            file_handle = open(file_path, "rb")
+            file_handles.append(file_handle)
+            files.append(("files", (os.path.basename(file_path), file_handle, "application/pdf")))
+
+        response = requests.post(
+            upload_url,
+            headers=headers,
+            data=data,
+            files=files,
+            timeout=MCP_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+    finally:
+        for file_handle in file_handles:
+            try:
+                file_handle.close()
+            except Exception:
+                pass
+
+
+def _wait_for_document_processing(upload_tasks, mcp_session_id):
+    deadline = time.time() + DOCUMENT_INDEX_STATUS_TIMEOUT_SECONDS
+    completed_doc_ids = []
+    pending_tasks = [task for task in upload_tasks if isinstance(task, dict)]
+
+    while pending_tasks:
+        if time.time() > deadline:
+            pending_ids = [str(task.get("doc_index_id", "")).strip() for task in pending_tasks]
+            raise TimeoutError(
+                f"Timed out waiting for document processing completion for doc_index_id(s): {pending_ids}"
+            )
+
+        remaining_tasks = []
+        for task in pending_tasks:
+            status_response = _invoke_mcp_tool("check_document_status", {"task": task}, mcp_session_id)
+            _raise_if_mcp_tool_error(status_response)
+            result = status_response.get("result", {}) if isinstance(status_response, dict) else {}
+            if not isinstance(result, dict):
+                remaining_tasks.append(task)
+                continue
+
+            status = str(result.get("status", "")).strip().lower()
+            completion_status = str(result.get("completion_status", "")).strip().lower()
+            doc_index_id = str(task.get("doc_index_id", "")).strip()
+
+            if status == "failed":
+                raise RuntimeError(
+                    f"Document processing failed for doc_index_id={doc_index_id}: {result.get('message', '')}"
+                )
+
+            if status == "completed" or completion_status == "fully_completed":
+                if doc_index_id and doc_index_id not in completed_doc_ids:
+                    completed_doc_ids.append(doc_index_id)
+                continue
+
+            remaining_tasks.append(task)
+
+        if not remaining_tasks:
+            return completed_doc_ids
+
+        pending_tasks = remaining_tasks
+        time.sleep(DOCUMENT_INDEX_STATUS_POLL_INTERVAL_SECONDS)
+
+    return completed_doc_ids
 
 
 def _extract_mcp_tool_error(mcp_response):
@@ -401,7 +501,7 @@ def run_document_index(**context):
 
             tool_name = "upload_documents"
             tool_args = {
-                "files": pdf_files,
+                "file_paths": pdf_files,
                 "process_id": process_id,
                 "doc_type": document_type,
                 "is_contract": is_contract,
@@ -414,8 +514,19 @@ def run_document_index(**context):
             log_type=0,
         )
         if tool_name == "upload_documents":
-            mcp_response = _invoke_mcp_tool(tool_name, tool_args, mcp_session_id)
-            _raise_if_mcp_tool_error(mcp_response)
+            log_to_mongo(
+                process_instance_id,
+                "Document Index",
+                f"Uploading {len(pdf_files)} file(s) via HTTP to processing service",
+                log_type=0,
+            )
+            http_upload_response = _upload_documents_via_http(
+                pdf_files,
+                process_id,
+                document_type,
+                is_contract,
+            )
+            mcp_response = {"result": http_upload_response}
 
             tasks = _extract_tasks(mcp_response)
             if not tasks:
@@ -424,31 +535,13 @@ def run_document_index(**context):
             upload_tasks = tasks
             mcp_context["upload_tasks"] = upload_tasks
 
-            process_document_ids = []
-            for task in upload_tasks:
-                doc_index_id = str(task.get("doc_index_id", "")).strip()
-                if not doc_index_id:
-                    raise RuntimeError("upload_documents task missing doc_index_id")
-
-                process_args = {
-                    "files": pdf_files,
-                    "process_id": process_id,
-                    "doc_index_id": doc_index_id,
-                    "document_type": document_type,
-                    "is_contract": is_contract,
-                }
-                log_to_mongo(
-                    process_instance_id,
-                    "Document Index",
-                    f"Calling MCP tool 'process_documents' for doc_index_id={doc_index_id}",
-                    log_type=0,
-                )
-                process_response = _invoke_mcp_tool("process_documents", process_args, mcp_session_id)
-                _raise_if_mcp_tool_error(process_response)
-                process_ids = _extract_document_ids(process_response)
-                for process_doc_id in process_ids:
-                    if process_doc_id not in process_document_ids:
-                        process_document_ids.append(process_doc_id)
+            log_to_mongo(
+                process_instance_id,
+                "Document Index",
+                f"Polling processing status for {len(upload_tasks)} uploaded document(s)",
+                log_type=0,
+            )
+            process_document_ids = _wait_for_document_processing(upload_tasks, mcp_session_id)
 
             if process_document_ids:
                 result = mcp_response.setdefault("result", {})
