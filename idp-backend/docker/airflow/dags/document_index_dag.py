@@ -4,7 +4,6 @@ from airflow.providers.mysql.hooks.mysql import MySqlHook
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pymongo import MongoClient
-import base64
 import json
 import os
 import requests
@@ -388,17 +387,6 @@ def _wait_for_document_processing(upload_tasks, mcp_session_id):
     return completed_doc_ids
 
 
-def _build_process_document_files(file_paths):
-    files = []
-
-    for file_path in file_paths:
-        with open(file_path, "rb") as f:
-            file_bytes = f.read()
-        files.append(base64.b64encode(file_bytes).decode("ascii"))
-
-    return files
-
-
 def _extract_mcp_tool_error(mcp_response):
     if not isinstance(mcp_response, dict):
         return ""
@@ -553,7 +541,6 @@ def run_document_index(**context):
             upload_tasks = tasks
             mcp_context["upload_tasks"] = upload_tasks
 
-            process_document_files = _build_process_document_files(pdf_files)
             process_document_ids = []
             for task in upload_tasks:
                 doc_index_id = str(task.get("doc_index_id", "")).strip()
@@ -561,7 +548,6 @@ def run_document_index(**context):
                     raise RuntimeError("upload_documents task missing doc_index_id")
 
                 process_args = {
-                    "files": process_document_files,
                     "process_id": process_id,
                     "doc_index_id": doc_index_id,
                     "document_type": document_type,
