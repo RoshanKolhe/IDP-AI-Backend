@@ -566,6 +566,7 @@ def run_document_index(**context):
                     log_type=0,
                 )
                 process_response = _invoke_mcp_tool("process_documents", process_args, mcp_session_id)
+                print('process response : ', process_response)
                 _raise_if_mcp_tool_error(process_response)
 
             log_to_mongo(
