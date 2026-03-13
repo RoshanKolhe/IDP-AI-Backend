@@ -338,61 +338,6 @@ def _upload_documents_via_http(file_paths, process_id, document_type, is_contrac
                 pass
 
 
-def _wait_for_document_processing(upload_tasks, mcp_session_id):
-    deadline = time.time() + DOCUMENT_INDEX_STATUS_TIMEOUT_SECONDS
-    completed_doc_ids = []
-    pending_tasks = [task for task in upload_tasks if isinstance(task, dict)]
-
-    while pending_tasks:
-        if time.time() > deadline:
-            pending_ids = [str(task.get("doc_index_id", "")).strip() for task in pending_tasks]
-            raise TimeoutError(
-                f"Timed out waiting for document processing completion for doc_index_id(s): {pending_ids}"
-            )
-
-        remaining_tasks = []
-        for task in pending_tasks:
-            status_task = {
-                "doc_index_id": task.get("doc_index_id"),
-                "process_id": task.get("process_id"),
-                "filename": task.get("filename"),
-                "user_id": task.get("user_id"),
-            }
-            status_response = _invoke_mcp_tool("check_document_status", {"task": status_task}, mcp_session_id)
-            print('status response : ', status_response)
-            _raise_if_mcp_tool_error(status_response)
-            result = status_response.get("result", {}) if isinstance(status_response, dict) else {}
-            structured_content = result.get("structuredContent", {}) if isinstance(result, dict) else {}
-            print('structured content : ', structured_content)
-            if not isinstance(result, dict):
-                remaining_tasks.append(task)
-                continue
-
-            status = str(structured_content.get("status", "")).strip().lower()
-            completion_status = str(structured_content.get("completion_status", "")).strip().lower()
-            doc_index_id = str(task.get("doc_index_id", "")).strip()
-
-            if status == "failed":
-                raise RuntimeError(
-                    f"Document processing failed for doc_index_id={doc_index_id}: {result.get('message', '')}"
-                )
-
-            if status == "completed" or completion_status == "fully_completed":
-                if doc_index_id and doc_index_id not in completed_doc_ids:
-                    completed_doc_ids.append(doc_index_id)
-                continue
-
-            remaining_tasks.append(task)
-
-        if not remaining_tasks:
-            return completed_doc_ids
-
-        pending_tasks = remaining_tasks
-        time.sleep(DOCUMENT_INDEX_STATUS_POLL_INTERVAL_SECONDS)
-
-    return completed_doc_ids
-
-
 def _extract_mcp_tool_error(mcp_response):
     if not isinstance(mcp_response, dict):
         return ""
@@ -568,14 +513,25 @@ def run_document_index(**context):
                 process_response = _invoke_mcp_tool("process_documents", process_args, mcp_session_id)
                 print('process response : ', process_response)
                 _raise_if_mcp_tool_error(process_response)
+                process_result = process_response.get("result", {}) if isinstance(process_response, dict) else {}
+                structured_content = (
+                    process_result.get("structuredContent", {}) if isinstance(process_result, dict) else {}
+                )
+                documents = structured_content.get("documents", []) if isinstance(structured_content, dict) else []
+                if not isinstance(documents, list):
+                    continue
 
-            log_to_mongo(
-                process_instance_id,
-                "Document Index",
-                f"Polling processing status for {len(upload_tasks)} uploaded document(s)",
-                log_type=0,
-            )
-            process_document_ids = _wait_for_document_processing(upload_tasks, mcp_session_id)
+                for document in documents:
+                    if not isinstance(document, dict):
+                        continue
+                    document_id = str(document.get("document_id", "")).strip()
+                    document_status = str(document.get("status", "")).strip().lower()
+                    if document_status == "failed":
+                        raise RuntimeError(
+                            f"Document processing failed for doc_index_id={doc_index_id}: {document.get('error')}"
+                        )
+                    if document_id and document_id not in process_document_ids:
+                        process_document_ids.append(document_id)
 
             if process_document_ids:
                 result = mcp_response.setdefault("result", {})
