@@ -51,6 +51,7 @@ NODE_TO_DAG_MAP = {
     "Integration": "integration_dag",
     "Image Processing": "image_processing_dag",
     "Code": "code_node_dag",
+    "AI Analyser": "ai_analyser_dag",
 }
 
 EXECUTABLE_TYPES = {
@@ -65,6 +66,7 @@ EXECUTABLE_TYPES = {
     "integration",
     "imageProcessing",
     "code",
+    "aiAnalyser",
 }
 
 DEFAULT_ARGS = {
