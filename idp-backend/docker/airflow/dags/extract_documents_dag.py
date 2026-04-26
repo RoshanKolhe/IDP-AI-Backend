@@ -19,24 +19,26 @@ import signal
 from contextlib import contextmanager
 from sentence_transformers import SentenceTransformer
 from transaction_status import sync_stage_status
+import ast
+
 log = LoggingMixin().log
 
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
-load_dotenv() 
+load_dotenv()
 
 AUTO_EXECUTE_NEXT_NODE = 1
 
 # === DAG Trigger CONFIG === #
-AIRFLOW_API_URL = "http://airflow-airflow-apiserver-1:8080/api/v2"  # or localhost in local mode
+AIRFLOW_API_URL = "http://airflow-airflow-apiserver-1:8080/api/v2"
 AIRFLOW_USERNAME = os.getenv("AIRFLOW_USERNAME")
 AIRFLOW_PASSWORD = os.getenv("AIRFLOW_PASSWORD")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # from .env
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OpenAI.api_key = OPENAI_API_KEY
-OPIK_API_KEY = os.getenv("OPIK_API_KEY")  
+OPIK_API_KEY = os.getenv("OPIK_API_KEY")
 LOCAL_MODE = os.getenv("LOCAL_MODE", "false").lower() == "true"
-MAX_PAGES_TO_SCAN = 100
+MAX_PAGES_TO_SCAN = 20
 
 if LOCAL_MODE:
     AIRFLOW_API_URL = "http://localhost:8080/api/v2"
@@ -49,8 +51,9 @@ MONGO_DB_NAME = "idp"
 MONGO_COLLECTION = "LogEntry"
 mongo_client = MongoClient(MONGO_URI)
 mongo_collection = mongo_client[MONGO_DB_NAME][MONGO_COLLECTION]
-openai_client = OpenAI()  
+openai_client = OpenAI()
 openai_client = track_openai(openai_client, project_name="my-idp-project")
+
 
 def _get_transaction_id(process_instance_id):
     tid_path = os.path.join(LOCAL_DOWNLOAD_DIR, f"process-instance-{process_instance_id}", "tid.json")
@@ -63,18 +66,22 @@ def _get_transaction_id(process_instance_id):
         print(f"Warning: failed to read transaction id from {tid_path}: {exc}")
         return None
 
-if not OpenAI.api_key or not OpenAI.api_key.startswith("sk-") and not OpenAI.api_key.startswith("sk-proj-"):
-    raise EnvironmentError("❌ OpenAI API key missing or invalid. Please set OPENAI_API_KEY as an environment variable.")
+
+if not OpenAI.api_key or (
+    not OpenAI.api_key.startswith("sk-") and not OpenAI.api_key.startswith("sk-proj-")
+):
+    raise EnvironmentError("OpenAI API key missing or invalid. Please set OPENAI_API_KEY.")
 
 
-# ---------------- Timeout ----------------
 class TimeoutException(Exception):
     pass
+
 
 @contextmanager
 def time_limit(seconds):
     def signal_handler(signum, frame):
         raise TimeoutException("Timed out!")
+
     signal.signal(signal.SIGALRM, signal_handler)
     signal.alarm(seconds)
     try:
@@ -82,15 +89,15 @@ def time_limit(seconds):
     finally:
         signal.alarm(0)
 
-# ---------------- Load ML field vectors ----------------
+
 try:
     VECTOR_PATH = os.path.join(ML_MODELS_DIR, "field_vectors.pkl")
-    print(f"🔍 Loading ML vectors from {VECTOR_PATH}")
+    print(f"Loading ML vectors from {VECTOR_PATH}")
     with open(VECTOR_PATH, "rb") as f:
         ml_data = pickle.load(f)
-    print("✅ Loaded field_vectors.pkl for ML extraction")
+    print("Loaded field_vectors.pkl for ML extraction")
 except Exception as e:
-    print(f"❌ Failed to load field_vectors.pkl: {e}")
+    print(f"Failed to load field_vectors.pkl: {e}")
     ml_data = {}
 
 ml_vectorizer = ml_data.get("tfidf_vectorizer")
@@ -103,19 +110,152 @@ ml_model = None
 if ml_X_emb is not None and embedding_model_name:
     try:
         ml_model = SentenceTransformer(embedding_model_name)
-        print(f"✅ Embedding model {embedding_model_name} loaded for ML extraction")
+        print(f"Embedding model {embedding_model_name} loaded for ML extraction")
     except Exception as e:
-        print(f"⚠️ Failed to load embedding model: {e}")
+        print(f"Failed to load embedding model: {e}")
 
-# ---------------- Preprocess ----------------
+
 def preprocess_text(text):
     if not text:
         return ""
     text = text.strip()
-    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r"\s+", " ", text)
     return text.lower()
 
-# ---------------- Extract text from PDF (ML) ----------------
+
+def preprocess_image(image):
+    import cv2
+
+    img = np.array(image)
+    if len(img.shape) == 2:
+        gray = img
+    else:
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    gray = cv2.equalizeHist(gray)
+    blur = cv2.medianBlur(gray, 3)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return thresh
+
+
+def perform_ocr_on_image(image):
+    processed_image = preprocess_image(image)
+    return pytesseract.image_to_string(
+        processed_image,
+        config="--oem 3 --psm 6"
+    )
+
+
+def normalize_extracted_value(value):
+    if not isinstance(value, str):
+        return value
+
+    normalized = re.sub(r"\s+", " ", value).strip()
+    if re.fullmatch(r"[\d,\.\- ]+", normalized):
+        normalized = normalized.replace(",", "")
+        normalized = normalized.replace(" ", "")
+    return normalized
+
+
+def normalize_extracted_payload(payload):
+    if isinstance(payload, dict):
+        return {key: normalize_extracted_payload(val) for key, val in payload.items()}
+    if isinstance(payload, list):
+        return [normalize_extracted_payload(item) for item in payload]
+    return normalize_extracted_value(payload)
+
+
+def page_contains_relevant_keywords(page_text, field_prompts, doc_type):
+    keywords = {"agreement", "contract", "amount", "date", "ref"}
+    keywords.add((doc_type or "").lower())
+
+    for field in field_prompts:
+        for key in [field.get("variableName", ""), field.get("field_to_extract", "")]:
+            for token in re.split(r"[^a-zA-Z0-9]+", key.lower()):
+                if len(token) > 2:
+                    keywords.add(token)
+
+    page_text_lower = page_text.lower()
+    return any(keyword and keyword in page_text_lower for keyword in keywords)
+
+
+def is_table_like_page(page_text):
+    lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+    if not lines:
+        return False
+
+    numeric_tokens = re.findall(r"\b\d+(?:[.,]\d+)?\b", page_text)
+    lines_with_many_numbers = sum(1 for line in lines if len(re.findall(r"\d+", line)) >= 3)
+    separator_lines = sum(1 for line in lines if "|" in line or "\t" in line)
+
+    return (
+        len(numeric_tokens) >= 25 and lines_with_many_numbers >= 5
+    ) or separator_lines >= 4
+
+
+def parse_json_response(content):
+    cleaned = content.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned.replace("```json", "", 1).replace("```", "").strip()
+    elif cleaned.startswith("```"):
+        cleaned = cleaned.replace("```", "").strip()
+
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        try:
+            return ast.literal_eval(cleaned)
+        except Exception:
+            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+            raise
+
+
+def build_multi_field_prompt(doc_type, field_prompts, page_text):
+    field_lines = []
+    for field in field_prompts:
+        variable_name = field.get("variableName", "")
+        field_label = field.get("field_to_extract", variable_name)
+        field_prompt = field.get("prompt", "")
+        if field_prompt:
+            field_lines.append(f'- "{variable_name}": {field_prompt}')
+        else:
+            field_lines.append(f'- "{variable_name}": extract "{field_label}"')
+
+    fields_block = "\n".join(field_lines)
+
+    return f"""
+This is a Work Order / Contract document for document type "{doc_type}".
+Extract relevant structured fields carefully.
+
+Extract the following fields from the document text.
+
+Fields:
+{fields_block}
+
+Rules:
+- Return JSON only.
+- Use the variable names exactly as keys.
+- If a field is not found, return "N/A".
+- If a value is numeric, return digits only when possible.
+- Do not infer BOQ/table rows or fabricate values.
+
+Text:
+{page_text[:4000]}
+"""
+
+
+def extract_all_fields_from_page(doc_type, field_prompts, page_text):
+    prompt = build_multi_field_prompt(doc_type, field_prompts, page_text)
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        timeout=30,
+    )
+    return parse_json_response(response.choices[0].message.content.strip())
+
+
 def ml_extract_text_from_pdf(pdf_path, max_pages=5):
     text_content = []
     try:
@@ -129,19 +269,19 @@ def ml_extract_text_from_pdf(pdf_path, max_pages=5):
             else:
                 try:
                     with time_limit(30):
-                        images = convert_from_path(pdf_path, first_page=i+1, last_page=i+1)
+                        images = convert_from_path(pdf_path, first_page=i + 1, last_page=i + 1)
                         if images:
-                            text = pytesseract.image_to_string(images[0])
+                            text = perform_ocr_on_image(images[0])
                             if text.strip():
                                 text_content.append(text)
                 except Exception as e:
-                    print(f"⚠️ OCR error on page {i+1} of {pdf_path}: {e}")
+                    print(f"OCR error on page {i + 1} of {pdf_path}: {e}")
     except Exception as e:
-        print(f"⚠️ Error reading {pdf_path}: {e}")
+        print(f"Error reading {pdf_path}: {e}")
 
     return "\n".join(text_content)
 
-# ---------------- ML Field Extraction ----------------
+
 def classify_text_for_field(field_name, text, threshold=0.3):
     if not text.strip():
         return None
@@ -154,7 +294,6 @@ def classify_text_for_field(field_name, text, threshold=0.3):
 
     best_val, best_score = None, -1
 
-    # Embedding similarity
     if ml_model and ml_X_emb is not None:
         try:
             cand_emb = ml_model.encode(candidates, convert_to_numpy=True, normalize_embeddings=True)
@@ -167,9 +306,8 @@ def classify_text_for_field(field_name, text, threshold=0.3):
             if best_score >= threshold:
                 return best_val
         except Exception as e:
-            print(f"⚠️ Embedding error for {field_name}: {e}")
+            print(f"Embedding error for {field_name}: {e}")
 
-    # TF–IDF fallback
     if ml_vectorizer is not None and ml_X_tfidf is not None:
         cand_tfidf = ml_vectorizer.transform(candidates)
         sims = cosine_similarity(cand_tfidf, ml_X_tfidf)
@@ -181,17 +319,18 @@ def classify_text_for_field(field_name, text, threshold=0.3):
 
     return best_val if best_score >= threshold else None
 
+
 def get_auth_token():
-    """Get JWT token from Airflow API"""
     auth_url = f"{AIRFLOW_API_URL.replace('/api/v2', '')}/auth/token"
     response = requests.post(
         auth_url,
         json={"username": AIRFLOW_USERNAME, "password": AIRFLOW_PASSWORD},
         headers={"Content-Type": "application/json"},
-        timeout=10
+        timeout=10,
     )
     response.raise_for_status()
     return response.json()["access_token"]
+
 
 def log_to_mongo(process_instance_id, node_name, message, log_type=1, remark=""):
     try:
@@ -200,41 +339,40 @@ def log_to_mongo(process_instance_id, node_name, message, log_type=1, remark="")
             "processInstanceTransactionId": _get_transaction_id(process_instance_id),
             "nodeName": node_name,
             "logsDescription": message,
-            "logType": log_type,  # 0=info, 1=error, 2=success, 3=warning
+            "logType": log_type,
             "isDeleted": False,
             "isActive": True,
             "remark": remark,
-            "createdAt": datetime.utcnow()
+            "createdAt": datetime.utcnow(),
         }
         mongo_collection.insert_one(log_entry)
-        print(f"📝 Logged to MongoDB: {message}")
+        print(f"Logged to MongoDB: {message}")
     except Exception as mongo_err:
-        print(f"⚠️ Failed to log to MongoDB: {mongo_err}")
+        print(f"Failed to log to MongoDB: {mongo_err}")
+
 
 def extract_text_from_pdf(pdf_path):
     try:
-        from PyPDF2 import PdfReader
         reader = PdfReader(pdf_path)
-        total_pages = len(reader.pages)
+        total_pages = min(len(reader.pages), MAX_PAGES_TO_SCAN)
 
         texts = []
         for i in range(1, total_pages + 1):
             images = convert_from_path(pdf_path, first_page=i, last_page=i)
             if images:
-                text = pytesseract.image_to_string(images[0])
-                texts.append(text)
+                texts.append(perform_ocr_on_image(images[0]))
         return texts
     except Exception as e:
-        print(f"❌ OCR failed for {pdf_path}: {e}")
-        log_to_mongo(process_instance_id, message = f"OCR failed for {pdf_path}: {e}", node_name = "Extraction", log_type=1)
+        print(f"OCR failed for {pdf_path}: {e}")
         return []
+
 
 def correct_typos_with_genai(extracted_data):
     try:
         prompt = f"""
         You are a helpful assistant. The following JSON contains field names and their extracted values from OCR-scanned documents.
         Some values may contain spelling errors. Correct typos only in field values.
-        Do not make unneccesary corrections in Name unless it is of english Origin.
+        Do not make unnecessary corrections in Name unless it is of English origin.
         Do not change field names, structure or formatting. Return only corrected JSON.
 
         JSON:
@@ -244,207 +382,247 @@ def correct_typos_with_genai(extracted_data):
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
-            timeout=60
+            timeout=60,
         )
         content = response.choices[0].message.content.strip()
-        if content.startswith("```json"):
-            content = content.replace("```json", "").replace("```", "").strip()
-        return json.loads(content)
+        corrected = parse_json_response(content)
+        return normalize_extracted_payload(corrected)
     except Exception as e:
-        print(f"❌ GenAI typo correction failed: {e}")
-        log_to_mongo(process_instance_id, message = f"GenAI typo correction failed: {e}", node_name = "Extraction", log_type=1)
+        print(f"GenAI typo correction failed: {e}")
         return extracted_data
 
+
 def extract_fields_from_documents(**context):
-    # Get process instance ID from DAG run configuration
     process_instance_id = context["dag_run"].conf.get("id")
     is_orchestrated = bool(context["dag_run"].conf.get("orchestrated", False))
     if not process_instance_id:
         raise ValueError("Missing process_instance_id in dag_run.conf")
-    
-    process_instance_dir_path = os.path.join(LOCAL_DOWNLOAD_DIR, "process-instance-" + str(process_instance_id))
-    os.makedirs(process_instance_dir_path, exist_ok=True)
-    EXTRACTED_FIELDS_PATH = os.path.join(process_instance_dir_path, "extracted_fields.json")
-    CLEANED_FIELDS_PATH = os.path.join(process_instance_dir_path, "cleaned_extracted_fields.json")
-    CLASSIFIED_JSON_PATH = os.path.join(process_instance_dir_path, "classified_documents.json")
-    BLUEPRINT_PATH = os.path.join(process_instance_dir_path, "blueprint.json")
 
-    # MySQL connection
+    process_instance_dir_path = os.path.join(LOCAL_DOWNLOAD_DIR, f"process-instance-{process_instance_id}")
+    os.makedirs(process_instance_dir_path, exist_ok=True)
+    extracted_fields_path = os.path.join(process_instance_dir_path, "extracted_fields.json")
+    cleaned_fields_path = os.path.join(process_instance_dir_path, "cleaned_extracted_fields.json")
+    classified_json_path = os.path.join(process_instance_dir_path, "classified_documents.json")
+    blueprint_path = os.path.join(process_instance_dir_path, "blueprint.json")
+
     hook = MySqlHook(mysql_conn_id="idp_mysql")
     conn = hook.get_conn()
     cursor = conn.cursor()
+    try:
+        if not os.path.exists(blueprint_path):
+            raise FileNotFoundError(f"Missing blueprint.json at {blueprint_path}")
+        with open(blueprint_path, "r", encoding="utf-8") as f:
+            blueprint = json.load(f)
 
-    # Load blueprint
-    if not os.path.exists(BLUEPRINT_PATH):
-        raise FileNotFoundError(f"❌ Missing blueprint.json at {BLUEPRINT_PATH}")
-        log_to_mongo(process_instance_id, message = f"Missing blueprint.json at {BLUEPRINT_PATH}", node_name = "Extraction", log_type=1)
-    with open(BLUEPRINT_PATH, "r") as f:
-        blueprint = json.load(f)
+        if not os.path.exists(classified_json_path):
+            raise FileNotFoundError("classified_documents.json not found.")
+        with open(classified_json_path, "r", encoding="utf-8") as f:
+            classified_docs = json.load(f)
 
-    # Load classification results
-    if not os.path.exists(CLASSIFIED_JSON_PATH):
-        raise FileNotFoundError("❌ classified_documents.json not found.")
-        log_to_mongo(process_instance_id, message = f"classified_documents.json not found.", node_name = "Extraction", log_type=1)
-    with open(CLASSIFIED_JSON_PATH, "r") as f:
-        classified_docs = json.load(f)
+        sync_stage_status(cursor, process_instance_id, "Extraction", 1)
+        conn.commit()
 
-    transaction_id = sync_stage_status(cursor, process_instance_id, "Extraction", 1)
-    conn.commit()
+        extract_node = next((n for n in blueprint if n["nodeName"].lower() == "extract"), None)
+        if not extract_node:
+            raise ValueError("No extract node found in blueprint.")
 
+        rules = extract_node["component"]
+        categories = {c["documentType"].lower(): c["id"] for c in rules["categories"]}
+        extractors = rules["extractors"]
+        extractor_fields = rules["extractorFields"]
 
-    extract_node = next((n for n in blueprint if n["nodeName"].lower() == "extract"), None)
-    if not extract_node:
-        raise ValueError("❌ No extract node found in blueprint.")
-        log_to_mongo(process_instance_id, message = f"No extract node found in blueprint.", node_name = "Extraction", log_type=1)
+        structured_results = []
+        total_api_calls = 0
+        total_skipped_pages = 0
 
-    rules = extract_node["component"]
-    categories = {c["documentType"].lower(): c["id"] for c in rules["categories"]}
-    extractors = rules["extractors"]
-    extractor_fields = rules["extractorFields"]
+        for file_name, doc_type in classified_docs.items():
+            doc_path = os.path.join(process_instance_dir_path, file_name)
+            if not os.path.exists(doc_path):
+                print(f"File not found: {file_name}")
+                log_to_mongo(process_instance_id, message=f"File not found: {file_name}", node_name="Extraction", log_type=3)
+                continue
 
-    structured_results = []
+            doc_type_lower = doc_type.lower()
+            doc_type_id = categories.get(doc_type_lower)
+            if not doc_type_id or str(doc_type_id) not in extractor_fields:
+                print(f"No extraction rules for {doc_type}")
+                log_to_mongo(process_instance_id, message=f"No extraction rules for {doc_type}", node_name="Extraction", log_type=3)
+                continue
 
-    for file_name, doc_type in classified_docs.items():
-        doc_path = os.path.join(process_instance_dir_path, file_name)
-        if not os.path.exists(doc_path):
-            print(f"⚠️ File not found: {file_name}")
-            log_to_mongo(process_instance_id, message = f"File not found: {file_name}", node_name = "Extraction", log_type=3)
-            continue
+            field_prompts = extractor_fields[str(doc_type_id)]
+            extracted = {field["variableName"]: "N/A" for field in field_prompts}
+            extractor_method = extractors.get(str(doc_type_id), "genai").lower()
 
-        doc_type_lower = doc_type.lower()
-        doc_type_id = categories.get(doc_type_lower)
-        if not doc_type_id or str(doc_type_id) not in extractor_fields:
-            print(f"⚠️ No extraction rules for {doc_type}")
-            log_to_mongo(process_instance_id, message = f"No extraction rules for {doc_type}", node_name = "Extraction", log_type=3)
-            continue
+            if extractor_method == "ml":
+                try:
+                    print(f"Using ML extractor for {file_name} ({doc_type})")
+                    ocr_text_full = ml_extract_text_from_pdf(doc_path, max_pages=MAX_PAGES_TO_SCAN)
+                    print(f"ML OCR text length for {file_name}: {len(ocr_text_full)}")
+                    log_to_mongo(
+                        process_instance_id,
+                        message=f"ML OCR text length for {file_name}: {len(ocr_text_full)}",
+                        node_name="Extraction",
+                        log_type=0,
+                    )
 
-        ocr_text = extract_text_from_pdf(doc_path)
-        field_prompts = extractor_fields[str(doc_type_id)]
-        extracted = {}
+                    for field in field_prompts:
+                        field_label = field["field_to_extract"]
+                        field_var = field["variableName"]
+                        val = classify_text_for_field(field_label, ocr_text_full, threshold=0.3)
+                        extracted[field_var] = normalize_extracted_value(val) if val else "Not Found"
+                except Exception as e:
+                    print(f"ML extraction failed for {file_name}: {e}")
+                    log_to_mongo(process_instance_id, message=f"ML extraction failed for {file_name}: {e}", node_name="Extraction", log_type=1)
+            else:
+                print(f"Using GenAI extractor for {file_name} ({doc_type})")
+                page_texts = extract_text_from_pdf(doc_path)
+                remaining_fields = {field["variableName"] for field in field_prompts}
 
-        ### Choose extraction method based on config ###
-        extractor_method = extractors.get(str(doc_type_id), "genai").lower()
-
-        if extractor_method == "ml":
-            # Run ML-based extraction
-            try:
-                print(f"🤖 Using ML extractor for {file_name} ({doc_type})")
-                ocr_text_full = ml_extract_text_from_pdf(doc_path, max_pages=5)
-                for field in field_prompts:
-                    field_label = field["field_to_extract"]
-                    field_var = field["variableName"]
-
-                    val = classify_text_for_field(field_label, ocr_text_full, threshold=0.3)
-                    extracted[field_var] = val if val else "Not Found"
-            except Exception as e:
-                print(f"❌ ML extraction failed for {file_name}: {e}")
-                log_to_mongo(process_instance_id, message = f"ML extraction failed for {file_name}: {e}", node_name = "Extraction", log_type=1)
-        else:
-            # Run GenAI-based extraction
-            print(f"🤖 Using GenAI extractor for {file_name} ({doc_type})")
-            for field in field_prompts:
-                field_name = field["variableName"]
-                inp_prompt = field["prompt"]
-                extracted_value = "N/A"
-                for page_num in range(1, MAX_PAGES_TO_SCAN + 1):
-                    try:
-                        images = convert_from_path(doc_path, first_page=page_num, last_page=page_num)
-                        if not images:
-                            continue
-                        page_image = images[0]
-                        page_text = pytesseract.image_to_string(page_image)
-                        
-                        if not inp_prompt:
-                            prompt = f"""
-                                The following is OCR-extracted text (Page {page_num} of the document). 
-                                Extract the value for field: "{field_name}".
-                                Return only the value without any additional text or explanation. If not found, return "N/A".
-				If the value is numeric, do not ever include the value in words. e.g. If value is Fifty, return '50' and not 'Fifty'.
-                                when value is supposed to be in multiple outputs, create an array of objects. 
-
-                                Text:
-                                {page_text[:1500]}
-                                                """
-                        else:
-                            prompt = f"{inp_prompt}\nText:\n{page_text[:1500]}"
-
-                        print("Prompt Used: " + prompt)
-
-                        log.info(f"🔍 Searching {field_name} from page {page_num} of {file_name}")
-                        response = openai_client.chat.completions.create(
-                            model="gpt-4o",
-                            messages=[{"role": "user", "content": prompt}],
-                            temperature=0.2,
-                            timeout=30
-                        )
-
-                        value = response.choices[0].message.content.strip()
-                        extracted[field_name] = value
-
-                        if value and value.upper() != "N/A":
-                            break  # ✅ Stop once value is found
-
-                    except Exception as e:
-                        print(f"⚠️ Error extracting {field_name} from page {page_num}: {e}")
-                        log_to_mongo(process_instance_id, message = f"Error extracting {field_name} from page {page_num}: {e}", node_name = "Extraction", log_type=1)
-                        extracted[field_name] = f"Error: {e}"
+                for page_num, page_text in enumerate(page_texts, start=1):
+                    if page_num > MAX_PAGES_TO_SCAN or not remaining_fields:
                         break
 
-        # Compose final JSON structure
-        structured_results.append({
-            "documentDetails": {
-                "documentName": file_name,
-                "documentType": doc_type
-            },
-            "extractedFields": extracted,
-            "processInstanceId": process_instance_id
-        }) 
+                    print(f"OCR text length for {file_name} page {page_num}: {len(page_text)}")
+                    log_to_mongo(
+                        process_instance_id,
+                        message=f"OCR text length for {file_name} page {page_num}: {len(page_text)}",
+                        node_name="Extraction",
+                        log_type=0,
+                    )
 
-    # Save raw extraction result
-    with open(EXTRACTED_FIELDS_PATH, "w") as f:
-        json.dump(structured_results, f, indent=2)
-    print(f"✅ Saved raw extracted_fields.json")
-    log_to_mongo(process_instance_id, message = f"Saved raw extracted_fields.json", node_name = "Extraction", log_type=2)
+                    if not page_contains_relevant_keywords(page_text, field_prompts, doc_type):
+                        total_skipped_pages += 1
+                        print(f"Skipping page {page_num} of {file_name}: no relevant keywords")
+                        log_to_mongo(
+                            process_instance_id,
+                            message=f"Skipped page {page_num} of {file_name}: no relevant keywords",
+                            node_name="Extraction",
+                            log_type=3,
+                        )
+                        continue
 
-    # Run GenAI-based typo correction
-    cleaned_data = correct_typos_with_genai(structured_results)
-    with open(CLEANED_FIELDS_PATH, "w") as f:
-        json.dump(cleaned_data, f, indent=2)
-    print(f"✅ Saved cleaned_extracted_fields.json")
-    log_to_mongo(process_instance_id, message = f"Saved cleaned_extracted_fields.json", node_name = "Extraction", log_type=2)
+                    if is_table_like_page(page_text):
+                        total_skipped_pages += 1
+                        print(f"Skipping page {page_num} of {file_name}: table/BOQ-like page")
+                        log_to_mongo(
+                            process_instance_id,
+                            message=f"Skipped page {page_num} of {file_name}: table/BOQ-like page",
+                            node_name="Extraction",
+                            log_type=3,
+                        )
+                        continue
 
-    # Trigger validate_documents_dag
-    if AUTO_EXECUTE_NEXT_NODE == 1 and not is_orchestrated:
-        print("🚀 Triggering validate_fields_dag...")
-        token = get_auth_token()
-        trigger_url = f"{AIRFLOW_API_URL}/dags/highlight_extracted_fields_dag/dagRuns"
-        run_id = f"triggered_by_extraction_{process_instance_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "dag_run_id": run_id,
-            "logical_date": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-            "conf": {"id": process_instance_id}
-        }
+                    current_fields = [field for field in field_prompts if field["variableName"] in remaining_fields]
+                    if not current_fields:
+                        break
 
-        response = requests.post(trigger_url, json=payload, headers=headers, timeout=10)
-        response.raise_for_status()
-        print(f"✅ Successfully triggered validate_fields_dag with ID {process_instance_id}")
-        log_to_mongo(process_instance_id, message = f"Successfully triggered validate_fields_dag with ID {process_instance_id}", node_name = "Extraction", log_type=2)
+                    try:
+                        total_api_calls += 1
+                        extracted_payload = extract_all_fields_from_page(doc_type, current_fields, page_text)
+                        extracted_payload = normalize_extracted_payload(extracted_payload)
+
+                        for field in current_fields:
+                            field_name = field["variableName"]
+                            value = extracted_payload.get(field_name, "N/A") if isinstance(extracted_payload, dict) else "N/A"
+                            if isinstance(value, str) and value.upper() == "N/A":
+                                continue
+                            if value in [None, "", [], {}]:
+                                continue
+                            extracted[field_name] = value
+                            remaining_fields.discard(field_name)
+
+                        log_to_mongo(
+                            process_instance_id,
+                            message=f"GenAI extraction API call #{total_api_calls} completed for {file_name} page {page_num}",
+                            node_name="Extraction",
+                            log_type=0,
+                        )
+                    except Exception as e:
+                        print(f"Error extracting fields from page {page_num} of {file_name}: {e}")
+                        log_to_mongo(
+                            process_instance_id,
+                            message=f"Error extracting fields from page {page_num} of {file_name}: {e}",
+                            node_name="Extraction",
+                            log_type=1,
+                        )
+
+                if not remaining_fields:
+                    print(f"All fields found early for {file_name}, stopping page scan")
+                    log_to_mongo(
+                        process_instance_id,
+                        message=f"All fields found early for {file_name}",
+                        node_name="Extraction",
+                        log_type=2,
+                    )
+
+            structured_results.append(
+                {
+                    "documentDetails": {
+                        "documentName": file_name,
+                        "documentType": doc_type,
+                    },
+                    "extractedFields": extracted,
+                    "processInstanceId": process_instance_id,
+                }
+            )
+
+        with open(extracted_fields_path, "w", encoding="utf-8") as f:
+            json.dump(structured_results, f, indent=2, ensure_ascii=False)
+        print("Saved raw extracted_fields.json")
+        log_to_mongo(process_instance_id, message="Saved raw extracted_fields.json", node_name="Extraction", log_type=2)
+
+        cleaned_data = correct_typos_with_genai(structured_results)
+        with open(cleaned_fields_path, "w", encoding="utf-8") as f:
+            json.dump(cleaned_data, f, indent=2, ensure_ascii=False)
+        print("Saved cleaned_extracted_fields.json")
+        log_to_mongo(process_instance_id, message="Saved cleaned_extracted_fields.json", node_name="Extraction", log_type=2)
+
+        print(f"Extraction summary: API calls={total_api_calls}, skipped_pages={total_skipped_pages}")
+        log_to_mongo(
+            process_instance_id,
+            message=f"Extraction summary: API calls={total_api_calls}, skipped_pages={total_skipped_pages}",
+            node_name="Extraction",
+            log_type=0,
+        )
+
+        if AUTO_EXECUTE_NEXT_NODE == 1 and not is_orchestrated:
+            print("Triggering validate_fields_dag...")
+            token = get_auth_token()
+            trigger_url = f"{AIRFLOW_API_URL}/dags/highlight_extracted_fields_dag/dagRuns"
+            run_id = f"triggered_by_extraction_{process_instance_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "dag_run_id": run_id,
+                "logical_date": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "conf": {"id": process_instance_id},
+            }
+
+            response = requests.post(trigger_url, json=payload, headers=headers, timeout=10)
+            response.raise_for_status()
+            print(f"Successfully triggered validate_fields_dag with ID {process_instance_id}")
+            log_to_mongo(
+                process_instance_id,
+                message=f"Successfully triggered validate_fields_dag with ID {process_instance_id}",
+                node_name="Extraction",
+                log_type=2,
+            )
+    finally:
+        cursor.close()
+        conn.close()
 
 
-# === DAG DEFINITION ===
 with DAG(
     dag_id="extract_documents_dag",
     start_date=datetime.now() - timedelta(days=1),
     schedule=None,
     catchup=False,
-    tags=["idp", "extraction"]
+    tags=["idp", "extraction"],
 ) as dag:
 
     extract_task = PythonOperator(
         task_id="extract_fields_from_documents",
-        python_callable=extract_fields_from_documents
+        python_callable=extract_fields_from_documents,
     )
