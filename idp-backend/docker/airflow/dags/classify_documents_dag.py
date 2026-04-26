@@ -336,7 +336,7 @@ def classify_documents(**context):
         log_to_mongo(process_instance_id, message = f"No categories found in Classify component", node_name = "Classification", log_type=2)
 
         for file_name in os.listdir(process_instance_dir_path):
-            if not file_name.endswith(".pdf"):
+            if not file_name.lower().endswith(".pdf"):
                 continue
             
             file_path = os.path.join(process_instance_dir_path, file_name)
