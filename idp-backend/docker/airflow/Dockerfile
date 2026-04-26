@@ -1,7 +1,7 @@
 FROM apache/airflow:3.0.1-python3.10
 
 USER airflow
-RUN pip install openai pytesseract pdf2image pyspellchecker Pillow img2pdf rapidfuzz fuzzywuzzy PyPDF2 pymongo opik scikit-learn scikit-image joblib sentence-transformers
+RUN pip install openai pytesseract pdf2image pyspellchecker Pillow img2pdf rapidfuzz fuzzywuzzy PyPDF2 pymongo opik scikit-learn scikit-image joblib sentence-transformers easyocr opencv-python-headless
 USER airflow
 
 USER root
