@@ -384,8 +384,7 @@ def extract_text_per_page(pdf_path, component=None, max_pages=None, logger_callb
                 ),
             )
     except Exception as e:
-        print(f"OCR failed for {pdf_path}: {e}")
-        return
+        raise RuntimeError(f"OCR failed: {e}")
 
 
 def classify_documents(**context):
