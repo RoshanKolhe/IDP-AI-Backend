@@ -4,8 +4,8 @@ USER airflow
 RUN pip install --no-cache-dir \
     openai \
     pytesseract \
-    paddleocr \
-    paddlepaddle==3.1.1 \
+    paddleocr==2.7.3 \
+    paddlepaddle==2.6.2 \
     pdf2image \
     pyspellchecker \
     Pillow \

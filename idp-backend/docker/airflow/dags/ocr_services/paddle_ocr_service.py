@@ -135,39 +135,29 @@ class PaddleOCRService(BaseOCRService):
         confidences = []
         lines = []
 
-        if not result:
-            return {
-                "text": "",
-                "confidence": 0.0,
-                "lines": []
-            }
+        if not result or not result[0]:
+            return {"text": "", "confidence": 0.0, "lines": []}
 
-        for block in result:
-            if isinstance(block, dict):
-                text = block.get("rec_text", "")
-                conf = float(block.get("rec_score", 0.0))
-                box = block.get("dt_polys", [])
+        for line in result[0]:
+            box = line[0]
+            text = line[1][0]
+            conf = float(line[1][1])
 
-                if text:
-                    texts.append(text)
-                    confidences.append(conf)
+            texts.append(text)
+            confidences.append(conf)
 
-                    lines.append({
-                        "text": text,
-                        "confidence": conf,
-                        "box": box
-                    })
+            lines.append({
+                "text": text,
+                "confidence": conf,
+                "box": box
+            })
 
         total_chars = sum(len(t) for t in texts) or 1
-
-        weighted_conf = sum(
-            len(texts[i]) * confidences[i]
-            for i in range(len(texts))
-        ) / total_chars
+        weighted = sum(len(texts[i]) * confidences[i] for i in range(len(texts))) / total_chars
 
         return {
             "text": "\n".join(texts),
-            "confidence": weighted_conf,
+            "confidence": weighted,
             "lines": lines
         }
 
