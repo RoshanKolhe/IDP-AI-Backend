@@ -94,6 +94,11 @@ class OptimizedOCRService(BaseOCRService):
             def extract_text(self, image, config=None):
                 config = config or {}
                 lang = config.get('language_mode', 'eng')
+                
+                # Fix language mapping - avoid 'auto' which causes issues
+                if lang == 'auto' or not lang:
+                    lang = 'eng'
+                
                 psm = config.get('psm', 6)  # Uniform text block
                 oem = config.get('oem', 3)  # LSTM only
                 
@@ -103,6 +108,11 @@ class OptimizedOCRService(BaseOCRService):
             def extract_with_confidence(self, image, config=None):
                 config = config or {}
                 lang = config.get('language_mode', 'eng')
+                
+                # Fix language mapping - avoid 'auto' which causes issues
+                if lang == 'auto' or not lang:
+                    lang = 'eng'
+                
                 psm = config.get('psm', 6)
                 oem = config.get('oem', 3)
                 
@@ -125,50 +135,92 @@ class OptimizedOCRService(BaseOCRService):
         return TesseractWrapper()
     
     def _create_paddle_engine(self):
-        """Create lightweight PaddleOCR engine wrapper"""
+        """Create lightweight PaddleOCR engine wrapper with error handling"""
         try:
             from paddleocr import PaddleOCR
             
             class PaddleWrapper:
                 def __init__(self):
-                    # Use lightweight configuration
-                    self.ocr = PaddleOCR(
-                        use_angle_cls=False,  # Disable angle classification for speed
-                        lang='en',
-                        show_log=False,
-                        use_gpu=False,  # CPU mode for stability
-                        det_model_dir=None,  # Use default lightweight models
-                        rec_model_dir=None,
-                        cls_model_dir=None
-                    )
+                    # Use safer configuration to avoid segmentation faults
+                    try:
+                        self.ocr = PaddleOCR(
+                            use_angle_cls=False,  # Disable angle classification for stability
+                            lang='en',
+                            show_log=False,
+                            use_gpu=False,  # CPU mode for stability
+                            det_model_dir=None,  # Use default lightweight models
+                            rec_model_dir=None,
+                            cls_model_dir=None,
+                            enable_mkldnn=False,  # Disable MKLDNN for compatibility
+                            cpu_threads=1,  # Single thread to avoid race conditions
+                        )
+                        self.initialized = True
+                    except Exception as e:
+                        logger.error(f"Failed to initialize PaddleOCR: {e}")
+                        self.initialized = False
                 
                 def extract_text(self, image, config=None):
+                    if not self.initialized:
+                        raise RuntimeError("PaddleOCR not properly initialized")
+                    
                     try:
-                        # Convert PIL to numpy array
+                        # Convert PIL to numpy array safely
                         if isinstance(image, Image.Image):
-                            image_array = np.array(image)
+                            image_array = np.array(image.convert('RGB'))
                         else:
                             image_array = image
                         
-                        result = self.ocr.ocr(image_array, cls=False)
+                        # Add timeout and error handling
+                        import signal
+                        
+                        def timeout_handler(signum, frame):
+                            raise TimeoutError("PaddleOCR processing timeout")
+                        
+                        # Set 30 second timeout
+                        signal.signal(signal.SIGALRM, timeout_handler)
+                        signal.alarm(30)
+                        
+                        try:
+                            result = self.ocr.ocr(image_array, cls=False)
+                        finally:
+                            signal.alarm(0)  # Cancel timeout
                         
                         if not result or not result[0]:
                             return ""
                         
                         texts = [line[1][0] for line in result[0] if line[1][0].strip()]
                         return '\n'.join(texts)
+                        
+                    except (TimeoutError, MemoryError, RuntimeError) as e:
+                        logger.warning(f"PaddleOCR extraction failed safely: {e}")
+                        raise RuntimeError(f"PaddleOCR processing failed: {e}")
                     except Exception as e:
-                        logger.warning(f"PaddleOCR extraction failed: {e}")
-                        return ""
+                        logger.error(f"PaddleOCR extraction failed: {e}")
+                        raise RuntimeError(f"PaddleOCR processing failed: {e}")
                 
                 def extract_with_confidence(self, image, config=None):
+                    if not self.initialized:
+                        raise RuntimeError("PaddleOCR not properly initialized")
+                    
                     try:
                         if isinstance(image, Image.Image):
-                            image_array = np.array(image)
+                            image_array = np.array(image.convert('RGB'))
                         else:
                             image_array = image
                         
-                        result = self.ocr.ocr(image_array, cls=False)
+                        # Add timeout protection
+                        import signal
+                        
+                        def timeout_handler(signum, frame):
+                            raise TimeoutError("PaddleOCR processing timeout")
+                        
+                        signal.signal(signal.SIGALRM, timeout_handler)
+                        signal.alarm(30)
+                        
+                        try:
+                            result = self.ocr.ocr(image_array, cls=False)
+                        finally:
+                            signal.alarm(0)
                         
                         if not result or not result[0]:
                             return {'text': '', 'confidence': 0.0}
@@ -189,14 +241,21 @@ class OptimizedOCRService(BaseOCRService):
                             'text': '\n'.join(texts),
                             'confidence': avg_confidence * 100  # Convert to percentage
                         }
+                        
+                    except (TimeoutError, MemoryError, RuntimeError) as e:
+                        logger.warning(f"PaddleOCR extraction with confidence failed safely: {e}")
+                        raise RuntimeError(f"PaddleOCR processing failed: {e}")
                     except Exception as e:
-                        logger.warning(f"PaddleOCR extraction with confidence failed: {e}")
-                        return {'text': '', 'confidence': 0.0}
+                        logger.error(f"PaddleOCR extraction with confidence failed: {e}")
+                        raise RuntimeError(f"PaddleOCR processing failed: {e}")
             
             return PaddleWrapper()
             
         except ImportError:
             logger.warning("PaddleOCR not available, falling back to Tesseract")
+            return self._create_tesseract_engine()
+        except Exception as e:
+            logger.error(f"Failed to create PaddleOCR wrapper: {e}")
             return self._create_tesseract_engine()
     
     def _create_easyocr_engine(self):

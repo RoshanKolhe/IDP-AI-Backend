@@ -157,18 +157,16 @@ def ensure_optimized_ocr_cache(
         # Get optimized OCR service
         ocr_service = get_ocr_service(ocr_engine)
         
-        if not isinstance(ocr_service, OptimizedOCRService):
-            # Fallback to regular processing for non-optimized services
+        # Handle different service types
+        if hasattr(ocr_service, 'extract_text_with_confidence'):
+            # For OptimizedOCRService and SafeOCRService
+            result = ocr_service.extract_text_with_confidence(pdf_path, optimized_config)
+        else:
+            # Fallback to regular processing for other services
             return _fallback_to_regular_processing(
                 pdf_path, process_instance_dir, ocr_engine, config, 
                 cleanup_service, logger_callback
             )
-        
-        # Configure optimized processing
-        optimized_config = _prepare_optimized_config(config)
-        
-        # Process PDF with optimized service
-        result = ocr_service.extract_text_with_confidence(pdf_path, optimized_config)
         
         # Get performance stats
         perf_stats = ocr_service.get_performance_stats()

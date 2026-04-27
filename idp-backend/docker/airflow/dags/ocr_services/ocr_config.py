@@ -18,7 +18,7 @@ class OCRConfig:
         self.environment = os.getenv("ENVIRONMENT", "development").lower()
         
         # Default OCR engine selection
-        self.default_engine = os.getenv("OCR_DEFAULT_ENGINE", "optimized")
+        self.default_engine = os.getenv("OCR_DEFAULT_ENGINE", "safe")
         
         # Performance settings
         self.max_workers = int(os.getenv("OCR_MAX_WORKERS", "4"))
@@ -28,27 +28,27 @@ class OCRConfig:
         # Engine-specific settings
         self.engine_configs = {
             "production": {
-                "primary_engine": "tesseract",
-                "fallback_engine": "paddle",
-                "dpi": 200,
-                "max_workers": 4,
-                "parallel_processing": True,
+                "primary_engine": "safe",  # Use safe service for production
+                "fallback_engine": None,
+                "dpi": 150,  # Lower DPI for stability
+                "max_workers": 2,  # Conservative worker count
+                "parallel_processing": False,  # Sequential for stability
                 "enable_performance_logging": True,
                 "cache_enabled": True,
-                "ai_cleanup_enabled": False,  # Disable for speed in production
+                "ai_cleanup_enabled": False,  # Disable for speed and stability
             },
             "development": {
-                "primary_engine": "tesseract", 
-                "fallback_engine": "paddle",
+                "primary_engine": "safe", 
+                "fallback_engine": None,
                 "dpi": 150,  # Lower DPI for faster development
-                "max_workers": 2,
-                "parallel_processing": True,
+                "max_workers": 1,  # Single worker for development
+                "parallel_processing": False,
                 "enable_performance_logging": True,
                 "cache_enabled": True,
-                "ai_cleanup_enabled": True,
+                "ai_cleanup_enabled": False,  # Keep simple for development
             },
             "testing": {
-                "primary_engine": "tesseract",
+                "primary_engine": "safe",
                 "fallback_engine": None,  # No fallback for faster tests
                 "dpi": 100,  # Minimal DPI for testing
                 "max_workers": 1,
@@ -88,28 +88,28 @@ class OCRConfig:
         
         component_configs = {
             "classification": {
-                "dpi": 200,  # Good balance for text recognition
-                "max_pages": 10,  # Usually only need first few pages for classification
-                "parallel_processing": True,
+                "dpi": 150,  # Lower DPI for faster classification
+                "max_pages": 5,  # Only need first few pages for classification
+                "parallel_processing": False,  # Sequential for stability
                 "ai_cleanup_enabled": False,  # Speed over accuracy for classification
             },
             "extraction": {
-                "dpi": 250,  # Higher DPI for better field extraction accuracy
-                "max_pages": 20,
-                "parallel_processing": True,
-                "ai_cleanup_enabled": True,  # Accuracy important for extraction
+                "dpi": 200,  # Higher DPI for better field extraction accuracy
+                "max_pages": 10,  # Reasonable limit for extraction
+                "parallel_processing": False,  # Sequential for stability
+                "ai_cleanup_enabled": False,  # Keep simple for now
             },
             "validation": {
-                "dpi": 200,
-                "max_pages": 5,  # Usually validate specific pages
+                "dpi": 150,
+                "max_pages": 3,  # Usually validate specific pages
                 "parallel_processing": False,  # Sequential for validation
                 "ai_cleanup_enabled": False,
             },
             "full_processing": {
-                "dpi": 300,  # High quality for complete processing
-                "max_pages": None,  # Process all pages
-                "parallel_processing": True,
-                "ai_cleanup_enabled": True,
+                "dpi": 200,  # Balanced quality
+                "max_pages": 20,  # Reasonable limit
+                "parallel_processing": False,  # Sequential for stability
+                "ai_cleanup_enabled": False,
             }
         }
         
@@ -127,14 +127,15 @@ class OCRConfig:
         """
         config = self.get_config(component)
         
-        # Determine engine based on configuration
-        if config.get("primary_engine") == "tesseract" and config.get("fallback_engine") == "paddle":
-            return "optimized"
-        elif config.get("primary_engine") == "paddle" and config.get("fallback_engine") == "tesseract":
-            return "optimized_paddle"
-        elif config.get("primary_engine") == "tesseract":
+        # Use safe service by default
+        primary_engine = config.get("primary_engine", "safe")
+        
+        # Map to actual engine names
+        if primary_engine == "safe":
+            return "safe"
+        elif primary_engine == "tesseract":
             return "tesseract"
-        elif config.get("primary_engine") == "paddle":
+        elif primary_engine == "paddle":
             return "paddle"
         else:
             return self.default_engine
@@ -216,15 +217,22 @@ def get_performance_config(component: str = None) -> Dict[str, Any]:
 Environment Variables for OCR Configuration:
 
 ENVIRONMENT: Environment name (production, development, testing) - default: development
-OCR_DEFAULT_ENGINE: Default OCR engine (optimized, tesseract, paddle) - default: optimized
+OCR_DEFAULT_ENGINE: Default OCR engine (safe, tesseract, paddle) - default: safe
 OCR_MAX_WORKERS: Maximum parallel workers - default: 4
-OCR_DEFAULT_DPI: Default image DPI - default: 200
-OCR_MAX_PAGES: Maximum pages per document - default: 50
+OCR_DEFAULT_DPI: Default image DPI - default: 150
+OCR_MAX_PAGES: Maximum pages per document - default: 20
 
-Example .env file:
+Example .env file for PRODUCTION (recommended):
 ENVIRONMENT=production
-OCR_DEFAULT_ENGINE=optimized
-OCR_MAX_WORKERS=6
-OCR_DEFAULT_DPI=200
-OCR_MAX_PAGES=100
+OCR_DEFAULT_ENGINE=safe
+OCR_MAX_WORKERS=2
+OCR_DEFAULT_DPI=150
+OCR_MAX_PAGES=20
+
+Example .env file for DEVELOPMENT:
+ENVIRONMENT=development
+OCR_DEFAULT_ENGINE=safe
+OCR_MAX_WORKERS=1
+OCR_DEFAULT_DPI=150
+OCR_MAX_PAGES=10
 """

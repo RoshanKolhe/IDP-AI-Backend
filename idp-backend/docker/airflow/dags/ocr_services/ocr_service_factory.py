@@ -7,6 +7,7 @@ from typing import Optional
 from .tesseract_ocr_service import TesseractOCRService
 from .paddle_ocr_service import PaddleOCRService
 from .optimized_ocr_service import OptimizedOCRService
+from .safe_ocr_service import SafeOCRService
 from .base_ocr_service import BaseOCRService
 
 
@@ -15,7 +16,7 @@ def get_ocr_service(ocr_engine: str) -> BaseOCRService:
     Factory function to get OCR service instance based on engine name
     
     Args:
-        ocr_engine: Name of OCR engine ('tesseract', 'paddle', 'optimized', etc.)
+        ocr_engine: Name of OCR engine ('safe', 'tesseract', 'paddle', 'optimized', etc.)
     
     Returns:
         Instance of OCR service implementing BaseOCRService
@@ -25,7 +26,13 @@ def get_ocr_service(ocr_engine: str) -> BaseOCRService:
     """
     ocr_engine = ocr_engine.lower().strip()
     
-    if ocr_engine == 'tesseract':
+    if ocr_engine == 'safe' or ocr_engine == 'safe_tesseract':
+        # Production-safe service with Tesseract only
+        return SafeOCRService(enable_paddle_fallback=False)
+    elif ocr_engine == 'safe_paddle':
+        # Safe service with PaddleOCR fallback (use with caution)
+        return SafeOCRService(enable_paddle_fallback=True)
+    elif ocr_engine == 'tesseract':
         return TesseractOCRService()
     elif ocr_engine == 'paddle':
         return PaddleOCRService()
@@ -53,6 +60,6 @@ def get_ocr_service(ocr_engine: str) -> BaseOCRService:
     else:
         raise ValueError(
             f"Unsupported OCR engine: {ocr_engine}. "
-            f"Supported engines: 'tesseract', 'paddle', 'optimized', 'optimized_paddle'"
+            f"Supported engines: 'safe', 'safe_paddle', 'tesseract', 'paddle', 'optimized', 'optimized_paddle'"
         )
 

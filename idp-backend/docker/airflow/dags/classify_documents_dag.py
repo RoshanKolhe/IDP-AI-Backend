@@ -133,7 +133,7 @@ def _extract_pdf_text_ml(file_path: str, component=None, max_pages=None, logger_
     cache_payload = ensure_optimized_ocr_cache(
         pdf_path=file_path,
         process_instance_dir=process_instance_dir,
-        ocr_engine=get_ocr_engine_name("classification"),
+        ocr_engine="safe",  # Use safe service to avoid segfaults
         config=_get_classification_ocr_config(component, last_page=max_pages or None),
         logger_callback=logger_callback,
     )
@@ -369,7 +369,7 @@ def extract_text_per_page(pdf_path, component=None, max_pages=None, logger_callb
         cache_payload = ensure_optimized_ocr_cache(
             pdf_path=pdf_path,
             process_instance_dir=process_instance_dir,
-            ocr_engine=get_ocr_engine_name("classification"),
+            ocr_engine="safe",  # Use safe service to avoid segfaults
             config=_get_classification_ocr_config(component, last_page=max_pages or None),
             logger_callback=logger_callback,
         )
