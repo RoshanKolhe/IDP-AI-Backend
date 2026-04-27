@@ -17,6 +17,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from transaction_status import sync_stage_status
 from ocr_services.ocr_service_factory import get_ocr_service
+from ocr_services.ocr_cache_utils import ensure_ocr_cache, get_cached_document_text, get_cached_page_texts
 
 load_dotenv()
 
@@ -84,7 +85,7 @@ def _normalize_text(text: str) -> str:
 def _get_ocr_service():
     global _OCR_SERVICE
     if _OCR_SERVICE is None:
-        _OCR_SERVICE = get_ocr_service("tesseract")
+        _OCR_SERVICE = get_ocr_service("paddle")
     return _OCR_SERVICE
 
 
@@ -114,6 +115,21 @@ def _extract_pdf_text_ml(file_path: str, component=None, max_pages=None) -> str:
     Extract text for ML classification using PDF-native text first and
     Tesseract OCR fallback. By default, all pages are scanned.
     """
+    process_instance_dir = os.path.dirname(file_path)
+    cached_text = get_cached_document_text(process_instance_dir, os.path.basename(file_path))
+    if cached_text and cached_text.strip():
+        return _normalize_text(cached_text)
+
+    cache_payload = ensure_ocr_cache(
+        pdf_path=file_path,
+        process_instance_dir=process_instance_dir,
+        ocr_engine=(component or {}).get("ocr_engine", "paddle"),
+        config=_get_classification_ocr_config(component, last_page=max_pages or None),
+    )
+    cached_text = cache_payload.get("cleaned_text") or cache_payload.get("raw_text") or ""
+    if cached_text.strip():
+        return _normalize_text(cached_text)
+
     text_parts = []
     total_pages = _get_pdf_page_count(file_path)
     pages_to_scan = total_pages if max_pages is None else min(total_pages, max_pages)
@@ -311,6 +327,27 @@ def get_auth_token():
 
 def extract_text_per_page(pdf_path, component=None, max_pages=None):
     try:
+        process_instance_dir = os.path.dirname(pdf_path)
+        cached_page_texts = get_cached_page_texts(process_instance_dir, os.path.basename(pdf_path))
+        if cached_page_texts:
+            page_limit = len(cached_page_texts) if max_pages is None else min(len(cached_page_texts), max_pages)
+            for page_text in cached_page_texts[:page_limit]:
+                yield page_text
+            return
+
+        cache_payload = ensure_ocr_cache(
+            pdf_path=pdf_path,
+            process_instance_dir=process_instance_dir,
+            ocr_engine=(component or {}).get("ocr_engine", "paddle"),
+            config=_get_classification_ocr_config(component, last_page=max_pages or None),
+        )
+        generated_page_texts = [page.get("cleaned_text") or page.get("text", "") for page in cache_payload.get("pages", [])]
+        if generated_page_texts:
+            page_limit = len(generated_page_texts) if max_pages is None else min(len(generated_page_texts), max_pages)
+            for page_text in generated_page_texts[:page_limit]:
+                yield page_text
+            return
+
         total_pages = _get_pdf_page_count(pdf_path)
         pages_to_scan = total_pages if max_pages is None else min(total_pages, max_pages)
         ocr_service = _get_ocr_service()
@@ -413,11 +450,11 @@ def classify_documents(**context):
         use_ml = model_choice == "ml"
 
         if use_ml:
-            print("Using ML classifier with Tesseract OCR text extraction")
+            print("Using ML classifier with cached OCR / PaddleOCR fallback")
             log_to_mongo(
                 process_instance_id,
                 node_name="Classification",
-                message="Using ML classifier with Tesseract OCR",
+                message="Using ML classifier with cached OCR / PaddleOCR fallback",
                 log_type=0,
             )
             try:
@@ -428,11 +465,11 @@ def classify_documents(**context):
                 log_to_mongo(process_instance_id, node_name="Classification", message=err, log_type=1)
                 raise
         else:
-            print("Using GENAI classifier with Tesseract OCR")
+            print("Using GENAI classifier with cached OCR / PaddleOCR fallback")
             log_to_mongo(
                 process_instance_id,
                 node_name="Classification",
-                message="Using GENAI classifier with Tesseract OCR",
+                message="Using GENAI classifier with cached OCR / PaddleOCR fallback",
                 log_type=0,
             )
 

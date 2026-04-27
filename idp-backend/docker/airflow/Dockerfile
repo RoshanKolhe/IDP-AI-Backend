@@ -4,6 +4,8 @@ USER airflow
 RUN pip install \
     openai \
     pytesseract \
+    paddleocr \
+    paddlepaddle==2.6.1 \
     pdf2image \
     pyspellchecker \
     Pillow \

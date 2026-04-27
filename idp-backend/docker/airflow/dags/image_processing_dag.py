@@ -12,13 +12,13 @@ import json
 import requests
 from dotenv import load_dotenv
 from pymongo import MongoClient
-from pdf2image import convert_from_path
 from openai import OpenAI
 from opik.integrations.openai import track_openai
 from transaction_status import sync_stage_status
 
 # Import OCR services
 from ocr_services.ocr_service_factory import get_ocr_service
+from ocr_services.ocr_cache_utils import ensure_ocr_cache, get_ocr_output_dir
 from ai_services.text_cleanup_service import TextCleanupService
 
 load_dotenv()
@@ -119,9 +119,7 @@ def process_documents_with_ocr(**context):
     )
     os.makedirs(process_instance_dir_path, exist_ok=True)
     
-    # Create OCR output directory
-    ocr_output_dir = os.path.join(process_instance_dir_path, "ocr_output")
-    os.makedirs(ocr_output_dir, exist_ok=True)
+    ocr_output_dir = get_ocr_output_dir(process_instance_dir_path)
     
     blueprint_path = os.path.join(process_instance_dir_path, "blueprint.json")
     
@@ -176,7 +174,7 @@ def process_documents_with_ocr(**context):
         
         # Get configuration from blueprint
         component = image_processing_node.get("component", {})
-        ocr_engine = component.get("ocr_engine", "tesseract").lower()
+        ocr_engine = component.get("ocr_engine", "paddle").lower()
         language_mode = component.get("language_mode", "auto")
         ai_cleanup = component.get("ai_cleanup", False)
         output_format = component.get("output_format", "txt")  # Default to txt
@@ -246,11 +244,20 @@ def process_documents_with_ocr(**context):
                 ocr_config = {
                     "language_mode": language_mode,
                     "psm": 3,  # Fully automatic page segmentation
-                    "oem": 3   # LSTM OCR engine
+                    "oem": 3,  # LSTM OCR engine
+                    "dpi": component.get("dpi", 300),
+                    "thread_count": component.get("thread_count", 2),
                 }
-                
-                # Extract text using OCR service
-                extracted_text = ocr_service.extract_text(pdf_path, ocr_config)
+
+                cache_payload = ensure_ocr_cache(
+                    pdf_path=pdf_path,
+                    process_instance_dir=process_instance_dir_path,
+                    ocr_engine=ocr_engine,
+                    config=ocr_config,
+                    cleanup_service=cleanup_service,
+                    force_refresh=True,
+                )
+                extracted_text = cache_payload.get("cleaned_text") or cache_payload.get("raw_text") or ""
                 
                 if not extracted_text or not extracted_text.strip():
                     warning_msg = f"No text extracted from {pdf_filename}"
@@ -262,7 +269,8 @@ def process_documents_with_ocr(**context):
                 
                 # Apply AI cleanup if enabled
                 final_text = extracted_text
-                if ai_cleanup and cleanup_service:
+                # The cache helper already performs cleanup, so skip a second pass here.
+                if False and ai_cleanup and cleanup_service:
                     try:
                         print(f"🤖 Applying AI cleanup to {pdf_filename}...")
                         final_text = cleanup_service.cleanup_text(extracted_text)
@@ -285,17 +293,8 @@ def process_documents_with_ocr(**context):
                 
                 if output_format.lower() == "json":
                     output_path = os.path.join(ocr_output_dir, f"{base_filename}.json")
-                    output_data = {
-                        "filename": pdf_filename,
-                        "extracted_text": final_text,
-                        "ocr_engine": ocr_engine,
-                        "language_mode": language_mode,
-                        "ai_cleanup_applied": ai_cleanup,
-                        "character_count": len(final_text),
-                        "processed_at": datetime.utcnow().isoformat()
-                    }
                     with open(output_path, "w", encoding="utf-8") as f:
-                        json.dump(output_data, f, indent=2, ensure_ascii=False)
+                        json.dump(cache_payload, f, indent=2, ensure_ascii=False)
                 else:
                     # Default to txt format
                     output_path = os.path.join(ocr_output_dir, f"{base_filename}.txt")

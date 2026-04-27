@@ -5,6 +5,7 @@ Factory pattern to create and return appropriate OCR service instances
 
 from typing import Optional
 from .tesseract_ocr_service import TesseractOCRService
+from .paddle_ocr_service import PaddleOCRService
 from .base_ocr_service import BaseOCRService
 
 
@@ -25,6 +26,8 @@ def get_ocr_service(ocr_engine: str) -> BaseOCRService:
     
     if ocr_engine == 'tesseract':
         return TesseractOCRService()
+    elif ocr_engine == 'paddle':
+        return PaddleOCRService()
     # Future implementations:
     # elif ocr_engine == 'easyocr':
     #     return EasyOCRService()
@@ -33,6 +36,6 @@ def get_ocr_service(ocr_engine: str) -> BaseOCRService:
     else:
         raise ValueError(
             f"Unsupported OCR engine: {ocr_engine}. "
-            f"Supported engines: 'tesseract'"
+            f"Supported engines: 'tesseract', 'paddle'"
         )
 

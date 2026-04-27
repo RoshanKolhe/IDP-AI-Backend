@@ -14,6 +14,7 @@ from opik.integrations.openai import track_openai
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from transaction_status import sync_stage_status
+from ocr_services.ocr_cache_utils import ensure_ocr_cache, get_cached_document_text
 
 load_dotenv() 
 
@@ -84,6 +85,21 @@ def get_auth_token():
     return response.json()["access_token"]
 
 def extract_text_from_pdf(pdf_path):
+    process_instance_dir = os.path.dirname(pdf_path)
+    cached_text = get_cached_document_text(process_instance_dir, os.path.basename(pdf_path))
+    if cached_text and cached_text.strip():
+        return cached_text
+
+    cache_payload = ensure_ocr_cache(
+        pdf_path=pdf_path,
+        process_instance_dir=process_instance_dir,
+        ocr_engine="paddle",
+        config={"dpi": 300},
+    )
+    cached_text = cache_payload.get("cleaned_text") or cache_payload.get("raw_text") or ""
+    if cached_text.strip():
+        return cached_text
+
     try:
         images = convert_from_path(pdf_path)
         return "".join(pytesseract.image_to_string(img) for img in images)

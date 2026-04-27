@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from sentence_transformers import SentenceTransformer
 from transaction_status import sync_stage_status
 import ast
+from ocr_services.ocr_cache_utils import ensure_ocr_cache, get_cached_document_text, get_cached_page_texts
 
 log = LoggingMixin().log
 
@@ -282,6 +283,21 @@ def extract_all_fields_from_page(doc_type, field_prompts, page_text):
 
 
 def ml_extract_text_from_pdf(pdf_path, max_pages=5):
+    process_instance_dir = os.path.dirname(pdf_path)
+    cached_text = get_cached_document_text(process_instance_dir, os.path.basename(pdf_path))
+    if cached_text and cached_text.strip():
+        return cached_text
+
+    cache_payload = ensure_ocr_cache(
+        pdf_path=pdf_path,
+        process_instance_dir=process_instance_dir,
+        ocr_engine="paddle",
+        config={"dpi": 300, "last_page": max_pages},
+    )
+    cached_text = cache_payload.get("cleaned_text") or cache_payload.get("raw_text") or ""
+    if cached_text.strip():
+        return cached_text
+
     text_content = []
     try:
         reader = PdfReader(pdf_path)
@@ -377,6 +393,21 @@ def log_to_mongo(process_instance_id, node_name, message, log_type=1, remark="")
 
 
 def extract_text_from_pdf(pdf_path):
+    process_instance_dir = os.path.dirname(pdf_path)
+    cached_page_texts = get_cached_page_texts(process_instance_dir, os.path.basename(pdf_path))
+    if cached_page_texts:
+        return cached_page_texts[:MAX_PAGES_TO_SCAN]
+
+    cache_payload = ensure_ocr_cache(
+        pdf_path=pdf_path,
+        process_instance_dir=process_instance_dir,
+        ocr_engine="paddle",
+        config={"dpi": 300, "last_page": MAX_PAGES_TO_SCAN},
+    )
+    generated_page_texts = [page.get("cleaned_text") or page.get("text", "") for page in cache_payload.get("pages", [])]
+    if generated_page_texts:
+        return generated_page_texts[:MAX_PAGES_TO_SCAN]
+
     try:
         reader = PdfReader(pdf_path)
         total_pages = min(len(reader.pages), MAX_PAGES_TO_SCAN)
