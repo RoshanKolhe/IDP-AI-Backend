@@ -1,11 +1,13 @@
 """
-Paddle OCR Service Implementation
-Handles text extraction using PaddleOCR engine
+Enhanced Paddle OCR Service
+Preserves original logic + improves OCR quality
 """
 
-from typing import Dict, Optional
-
+from typing import Dict, Optional, List
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
+import cv2
+
 from pdf2image import convert_from_path
 from PIL import Image
 
@@ -13,7 +15,7 @@ from .base_ocr_service import BaseOCRService
 
 
 class PaddleOCRService(BaseOCRService):
-    """PaddleOCR service implementation."""
+    """Enhanced PaddleOCR service implementation."""
 
     SUPPORTED_LANGUAGES = [
         "en",
@@ -27,7 +29,6 @@ class PaddleOCRService(BaseOCRService):
     def __init__(self):
         try:
             from paddleocr import PaddleOCR
-
             self._engine_cls = PaddleOCR
         except Exception as exc:
             raise RuntimeError(f"PaddleOCR not available: {exc}")
@@ -35,20 +36,31 @@ class PaddleOCRService(BaseOCRService):
         self._ocr_engine = None
         self._engine_config = None
 
+    # -------------------------
+    # LANGUAGE HELPERS
+    # -------------------------
+
     def _normalize_language(self, language_mode: Optional[str]) -> str:
         if not language_mode or language_mode == "auto":
             return "en"
 
         language_mode = language_mode.lower().strip()
+
         language_map = {
             "eng": "en",
             "eng+hin": "en",
             "hin": "devanagari",
         }
+
         return language_map.get(language_mode, language_mode)
+
+    # -------------------------
+    # ENGINE CACHE
+    # -------------------------
 
     def _get_engine(self, config: Optional[Dict] = None):
         config = config or {}
+
         lang = self._normalize_language(config.get("language_mode"))
         use_angle_cls = bool(config.get("use_angle_cls", True))
 
@@ -65,84 +77,227 @@ class PaddleOCRService(BaseOCRService):
 
         return self._ocr_engine
 
+    # -------------------------
+    # PDF CONFIG
+    # -------------------------
+
     def _get_pdf_convert_kwargs(self, config: Optional[Dict] = None) -> Dict:
         config = config or {}
-        convert_kwargs = {
+
+        kwargs = {
             "dpi": config.get("dpi", 300),
         }
 
         if config.get("first_page") is not None:
-            convert_kwargs["first_page"] = config["first_page"]
+            kwargs["first_page"] = config["first_page"]
+
         if config.get("last_page") is not None:
-            convert_kwargs["last_page"] = config["last_page"]
+            kwargs["last_page"] = config["last_page"]
+
         if config.get("thread_count") is not None:
-            convert_kwargs["thread_count"] = config["thread_count"]
+            kwargs["thread_count"] = config["thread_count"]
 
-        return convert_kwargs
+        return kwargs
 
-    def _image_to_array(self, image_path: str) -> np.ndarray:
-        image = Image.open(image_path).convert("RGB")
-        return np.array(image)
+    # -------------------------
+    # IMAGE PREPROCESSING
+    # -------------------------
 
-    def _extract_page_result(self, image, config: Optional[Dict] = None) -> Dict:
+    def _preprocess_image(self, image: Image.Image) -> np.ndarray:
+        img = np.array(image.convert("RGB"))
+
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+        gray = cv2.fastNlMeansDenoising(gray)
+
+        gray = cv2.resize(
+            gray,
+            None,
+            fx=2,
+            fy=2,
+            interpolation=cv2.INTER_CUBIC
+        )
+
+        thresh = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            11
+        )
+
+        final = cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB)
+
+        return final
+
+    # -------------------------
+    # OCR PAGE EXTRACTION
+    # -------------------------
+
+    def _extract_page_result(
+        self,
+        image: Image.Image,
+        config: Optional[Dict] = None
+    ) -> Dict:
+
+        config = config or {}
+
         ocr_engine = self._get_engine(config)
-        image_array = np.array(image.convert("RGB"))
-        result = ocr_engine.ocr(image_array, cls=bool((config or {}).get("use_angle_cls", True)))
+
+        processed = self._preprocess_image(image)
+
+        result = ocr_engine.ocr(
+            processed,
+            cls=bool(config.get("use_angle_cls", True))
+        )
+
         lines = result[0] if result else []
 
         texts = []
         confidences = []
+        structured_lines = []
+
         for line in lines or []:
             if not line or len(line) < 2:
                 continue
+
+            box = line[0]
             text = line[1][0] if len(line[1]) > 0 else ""
-            confidence = float(line[1][1]) if len(line[1]) > 1 else 0.0
+            conf = float(line[1][1]) if len(line[1]) > 1 else 0.0
+
             if text:
                 texts.append(text)
-                confidences.append(confidence)
+                confidences.append(conf)
+
+                structured_lines.append({
+                    "text": text,
+                    "confidence": conf,
+                    "box": box
+                })
+
+        # weighted confidence by text length
+        total_chars = sum(len(t) for t in texts) or 1
+
+        weighted_conf = sum(
+            len(texts[i]) * confidences[i]
+            for i in range(len(texts))
+        ) / total_chars
 
         return {
             "text": "\n".join(texts),
-            "confidence": (sum(confidences) / len(confidences)) if confidences else 0.0,
+            "confidence": weighted_conf,
+            "lines": structured_lines,
         }
 
-    def extract_text(self, image_path: str, config: Optional[Dict] = None) -> str:
+    # -------------------------
+    # MAIN TEXT EXTRACTION
+    # -------------------------
+
+    def extract_text(
+        self,
+        image_path: str,
+        config: Optional[Dict] = None
+    ) -> str:
+
         config = config or {}
 
-        if image_path.lower().endswith(".pdf"):
-            images = convert_from_path(image_path, **self._get_pdf_convert_kwargs(config))
-            page_texts = []
-            for image in images:
-                page_result = self._extract_page_result(image, config)
-                if page_result["text"].strip():
-                    page_texts.append(page_result["text"])
-            return "\n".join(page_texts)
+        try:
+            if image_path.lower().endswith(".pdf"):
 
-        image = Image.open(image_path)
-        return self._extract_page_result(image, config)["text"]
+                images = convert_from_path(
+                    image_path,
+                    **self._get_pdf_convert_kwargs(config)
+                )
 
-    def extract_text_with_confidence(self, image_path: str, config: Optional[Dict] = None) -> Dict:
+                workers = config.get("workers", 4)
+
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    results = list(
+                        executor.map(
+                            lambda img: self._extract_page_result(img, config),
+                            images
+                        )
+                    )
+
+                return "\n\n".join(
+                    r["text"] for r in results if r["text"].strip()
+                )
+
+            image = Image.open(image_path)
+
+            return self._extract_page_result(image, config)["text"]
+
+        except Exception as exc:
+            raise RuntimeError(f"OCR extraction failed: {exc}")
+
+    # -------------------------
+    # TEXT + CONFIDENCE
+    # -------------------------
+
+    def extract_text_with_confidence(
+        self,
+        image_path: str,
+        config: Optional[Dict] = None
+    ) -> Dict:
+
         config = config or {}
 
-        if image_path.lower().endswith(".pdf"):
-            images = convert_from_path(image_path, **self._get_pdf_convert_kwargs(config))
-            page_results = [self._extract_page_result(image, config) for image in images]
-            text = "\n".join(result["text"] for result in page_results if result["text"].strip())
-            confidences = [result["confidence"] for result in page_results if result["text"].strip()]
-            return {
-                "text": text,
-                "confidence": (sum(confidences) / len(confidences)) if confidences else 0.0,
-            }
+        try:
+            if image_path.lower().endswith(".pdf"):
 
-        image = Image.open(image_path)
-        return self._extract_page_result(image, config)
+                images = convert_from_path(
+                    image_path,
+                    **self._get_pdf_convert_kwargs(config)
+                )
+
+                workers = config.get("workers", 4)
+
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    results = list(
+                        executor.map(
+                            lambda img: self._extract_page_result(img, config),
+                            images
+                        )
+                    )
+
+                text = "\n\n".join(
+                    r["text"] for r in results if r["text"].strip()
+                )
+
+                confs = [
+                    r["confidence"]
+                    for r in results
+                    if r["text"].strip()
+                ]
+
+                return {
+                    "text": text,
+                    "confidence": (
+                        sum(confs) / len(confs)
+                        if confs else 0.0
+                    ),
+                    "pages": results,
+                }
+
+            image = Image.open(image_path)
+
+            return self._extract_page_result(image, config)
+
+        except Exception as exc:
+            raise RuntimeError(f"OCR extraction failed: {exc}")
+
+    # -------------------------
+    # LANGUAGE SUPPORT
+    # -------------------------
 
     def supports_language(self, language_code: str) -> bool:
         if not language_code or language_code == "auto":
             return True
 
         normalized = self._normalize_language(language_code)
+
         return normalized in self.SUPPORTED_LANGUAGES
 
-    def get_supported_languages(self) -> list:
+    def get_supported_languages(self) -> List[str]:
         return self.SUPPORTED_LANGUAGES
