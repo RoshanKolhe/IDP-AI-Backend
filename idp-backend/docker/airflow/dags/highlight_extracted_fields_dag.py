@@ -112,9 +112,10 @@ def extract_text_from_pdf(pdf_path, logger_callback=None):
     cache_payload = ensure_ocr_cache(
         pdf_path=pdf_path,
         process_instance_dir=process_instance_dir,
-        ocr_engine="paddle",
+        ocr_engine="paddle_first",
         config={"dpi": 300},
         logger_callback=logger_callback,
+        fallback_ocr_engine="tesseract",
     )
     cached_text = cache_payload.get("cleaned_text") or cache_payload.get("raw_text") or ""
     if cached_text.strip():

@@ -52,7 +52,12 @@ def get_ocr_service(ocr_engine: str) -> BaseOCRService:
     elif ocr_engine == 'tesseract':
         return TesseractOCRService()
     elif ocr_engine == 'paddle':
-        return PaddleOCRService()
+        return PaddleFirstOCRService(
+            paddle_timeout=45,
+            tesseract_timeout=30,
+            min_confidence_threshold=25.0,
+            enable_preprocessing=True
+        )
     elif ocr_engine == 'optimized':
         # Production-grade optimized service with Tesseract primary, Paddle fallback
         return OptimizedOCRService(

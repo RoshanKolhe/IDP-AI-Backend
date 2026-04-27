@@ -18,7 +18,7 @@ from transaction_status import sync_stage_status
 
 # Import OCR services
 from ocr_services.ocr_service_factory import get_ocr_service
-from ocr_services.optimized_ocr_cache_utils import ensure_optimized_ocr_cache, get_ocr_output_dir
+from ocr_services.ocr_cache_utils import ensure_ocr_cache, get_ocr_output_dir
 from ai_services.text_cleanup_service import TextCleanupService
 
 load_dotenv()
@@ -189,7 +189,9 @@ def process_documents_with_ocr(**context):
         
         # Get configuration from blueprint
         component = image_processing_node.get("component", {})
-        ocr_engine = component.get("ocr_engine", "paddle").lower()
+        ocr_engine = component.get("ocr_engine", "paddle_first").lower()
+        if ocr_engine == "paddle":
+            ocr_engine = "paddle_first"
         language_mode = component.get("language_mode", "auto")
         ai_cleanup = component.get("ai_cleanup", False)
         output_format = component.get("output_format", "txt")  # Default to txt

@@ -141,10 +141,43 @@ def _resolve_page_text(page_result: Dict) -> str:
     return (page_result.get("cleaned_text") or page_result.get("text") or "").strip()
 
 
+def _score_ocr_result(result: Optional[Dict]) -> float:
+    if not result:
+        return -1.0
+
+    text = (result.get("text") or "").strip()
+    confidence = float(result.get("confidence", 0.0) or 0.0)
+    if not text:
+        return -1.0
+
+    # Prefer actual extracted characters first, then confidence as a tiebreaker.
+    return (len(text) * 10.0) + confidence
+
+
+def _needs_fallback(result: Optional[Dict]) -> bool:
+    if not result:
+        return True
+
+    text = (result.get("text") or "").strip()
+    confidence = float(result.get("confidence", 0.0) or 0.0)
+    meaningful_tokens = [token for token in text.split() if len(token.strip()) > 1]
+
+    if not text:
+        return True
+
+    if len(text) < 12 and confidence < 40.0:
+        return True
+
+    if len(meaningful_tokens) == 0:
+        return True
+
+    return False
+
+
 def ensure_ocr_cache(
     pdf_path: str,
     process_instance_dir: str,
-    ocr_engine: str = "paddle",
+    ocr_engine: str = "paddle_first",
     config: Optional[Dict] = None,
     cleanup_service=None,
     force_refresh: bool = False,
@@ -182,10 +215,13 @@ def ensure_ocr_cache(
     page_results = []
 
     for page_number, image in enumerate(images, start=1):
-        enhanced_image = enhance_image_for_ocr(image)
-        temp_image_path = os.path.join(
+        original_temp_image_path = os.path.join(
             get_ocr_output_dir(process_instance_dir),
-            f".tmp_{os.path.splitext(pdf_filename)[0]}_{page_number}.png",
+            f".tmp_{os.path.splitext(pdf_filename)[0]}_{page_number}_orig.png",
+        )
+        enhanced_temp_image_path = os.path.join(
+            get_ocr_output_dir(process_instance_dir),
+            f".tmp_{os.path.splitext(pdf_filename)[0]}_{page_number}_enh.png",
         )
 
         try:
@@ -195,21 +231,41 @@ def ensure_ocr_cache(
                     f"Scanning {pdf_filename} page {page_number}/{len(images)} with {ocr_engine}",
                 )
 
-            enhanced_image.save(temp_image_path, format="PNG")
+            image.convert("RGB").save(original_temp_image_path, format="PNG")
+            enhanced_image = enhance_image_for_ocr(image)
+            enhanced_image.save(enhanced_temp_image_path, format="PNG")
             page_conf = dict(config)
-            page_result = ocr_service.extract_text_with_confidence(temp_image_path, page_conf)
+            original_result = ocr_service.extract_text_with_confidence(original_temp_image_path, page_conf)
+            enhanced_result = ocr_service.extract_text_with_confidence(enhanced_temp_image_path, page_conf)
+            page_result = max(
+                [original_result, enhanced_result],
+                key=_score_ocr_result,
+            )
             page_text = (page_result.get("text") or "").strip()
 
-            if not page_text and fallback_service:
-                fallback_result = fallback_service.extract_text_with_confidence(temp_image_path, page_conf)
+            if logger_callback:
+                logger_callback(
+                    "info",
+                    f"OCR variants for {pdf_filename} page {page_number}: "
+                    f"original_chars={len((original_result.get('text') or '').strip())}, "
+                    f"enhanced_chars={len((enhanced_result.get('text') or '').strip())}",
+                )
+
+            if fallback_service and _needs_fallback(page_result):
+                fallback_original = fallback_service.extract_text_with_confidence(original_temp_image_path, page_conf)
+                fallback_enhanced = fallback_service.extract_text_with_confidence(enhanced_temp_image_path, page_conf)
+                fallback_result = max(
+                    [fallback_original, fallback_enhanced],
+                    key=_score_ocr_result,
+                )
                 fallback_text = (fallback_result.get("text") or "").strip()
-                if fallback_text:
+                if _score_ocr_result(fallback_result) > _score_ocr_result(page_result):
                     page_result = fallback_result
                     page_text = fallback_text
                     if logger_callback:
                         logger_callback(
                             "warning",
-                            f"{ocr_engine} returned empty OCR for {pdf_filename} page {page_number}; used {fallback_ocr_engine} fallback",
+                            f"{ocr_engine} returned weak OCR for {pdf_filename} page {page_number}; used {fallback_ocr_engine} fallback",
                         )
 
             cleaned_page_text = page_text
@@ -235,8 +291,10 @@ def ensure_ocr_cache(
                     f"OCR finished for {pdf_filename} page {page_number}: chars={len(page_text)}, confidence={round(float(page_result.get('confidence', 0.0)), 2)}",
                 )
         finally:
-            if os.path.exists(temp_image_path):
-                os.remove(temp_image_path)
+            if os.path.exists(original_temp_image_path):
+                os.remove(original_temp_image_path)
+            if os.path.exists(enhanced_temp_image_path):
+                os.remove(enhanced_temp_image_path)
 
     cleaned_text = "\n".join(
         _resolve_page_text(page_result) for page_result in page_results if _resolve_page_text(page_result)

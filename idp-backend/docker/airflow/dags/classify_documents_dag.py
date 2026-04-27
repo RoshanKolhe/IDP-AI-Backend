@@ -17,8 +17,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from transaction_status import sync_stage_status
 from ocr_services.ocr_service_factory import get_ocr_service
-from ocr_services.optimized_ocr_cache_utils import ensure_optimized_ocr_cache, get_cached_document_text, get_cached_page_texts
-from ocr_services.ocr_config import get_ocr_engine_name, get_performance_config
+from ocr_services.ocr_cache_utils import ensure_ocr_cache, get_cached_document_text, get_cached_page_texts
 
 load_dotenv()
 
@@ -86,7 +85,7 @@ def _normalize_text(text: str) -> str:
 def _get_ocr_service():
     global _OCR_SERVICE
     if _OCR_SERVICE is None:
-        _OCR_SERVICE = get_ocr_service("paddle")
+        _OCR_SERVICE = get_ocr_service("paddle_first")
     return _OCR_SERVICE
 
 
@@ -130,12 +129,13 @@ def _extract_pdf_text_ml(file_path: str, component=None, max_pages=None, logger_
     if cached_text and cached_text.strip():
         return _normalize_text(cached_text)
 
-    cache_payload = ensure_optimized_ocr_cache(
+    cache_payload = ensure_ocr_cache(
         pdf_path=file_path,
         process_instance_dir=process_instance_dir,
-        ocr_engine="paddle_first",  # Use PaddleOCR first for better accuracy on poor quality docs
+        ocr_engine="paddle_first",
         config=_get_classification_ocr_config(component, last_page=max_pages or None),
         logger_callback=logger_callback,
+        fallback_ocr_engine="tesseract",
     )
     cached_text = cache_payload.get("cleaned_text") or cache_payload.get("raw_text") or ""
     if cached_text.strip():
@@ -366,12 +366,13 @@ def extract_text_per_page(pdf_path, component=None, max_pages=None, logger_callb
                 yield page_text
             return
 
-        cache_payload = ensure_optimized_ocr_cache(
+        cache_payload = ensure_ocr_cache(
             pdf_path=pdf_path,
             process_instance_dir=process_instance_dir,
-            ocr_engine="paddle_first",  # Use PaddleOCR first for better accuracy on poor quality docs
+            ocr_engine="paddle_first",
             config=_get_classification_ocr_config(component, last_page=max_pages or None),
             logger_callback=logger_callback,
+            fallback_ocr_engine="tesseract",
         )
         generated_page_texts = [page.get("cleaned_text") or page.get("text", "") for page in cache_payload.get("pages", [])]
         if generated_page_texts:
