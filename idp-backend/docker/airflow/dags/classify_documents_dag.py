@@ -110,7 +110,7 @@ def _get_classification_ocr_config(component=None, **overrides):
     return config
 
 
-def _extract_pdf_text_ml(file_path: str, component=None, max_pages=None) -> str:
+def _extract_pdf_text_ml(file_path: str, component=None, max_pages=None, logger_callback=None) -> str:
     """
     Extract text for ML classification using PDF-native text first and
     Tesseract OCR fallback. By default, all pages are scanned.
@@ -125,6 +125,7 @@ def _extract_pdf_text_ml(file_path: str, component=None, max_pages=None) -> str:
         process_instance_dir=process_instance_dir,
         ocr_engine=(component or {}).get("ocr_engine", "paddle"),
         config=_get_classification_ocr_config(component, last_page=max_pages or None),
+        logger_callback=logger_callback,
     )
     cached_text = cache_payload.get("cleaned_text") or cache_payload.get("raw_text") or ""
     if cached_text.strip():
@@ -236,6 +237,7 @@ def classify_document_ml(
     threshold_embed: float = 0.35,
     threshold_tfidf: float = 0.25,
     max_pages=None,
+    logger_callback=None,
 ) -> str:
     """
     Classify a PDF using prebuilt vectors (embeddings -> TF-IDF fallback).
@@ -251,7 +253,7 @@ def classify_document_ml(
     vectorizer = assets["vectorizer"]
     embeddings_data = assets["embeddings_data"]
 
-    text = _extract_pdf_text_ml(file_path, component=component, max_pages=max_pages)
+    text = _extract_pdf_text_ml(file_path, component=component, max_pages=max_pages, logger_callback=logger_callback)
     if not text.strip():
         return "Unknown"
 
@@ -313,6 +315,25 @@ def log_to_mongo(process_instance_id, node_name, message, log_type=1, remark="")
         print(f"Failed to log to MongoDB: {mongo_err}")
 
 
+def build_ocr_logger(process_instance_id, node_name):
+    def _logger(level, message):
+        level_map = {
+            "info": 0,
+            "error": 1,
+            "success": 2,
+            "warning": 3,
+        }
+        print(message)
+        log_to_mongo(
+            process_instance_id,
+            node_name=node_name,
+            message=message,
+            log_type=level_map.get(level, 0),
+        )
+
+    return _logger
+
+
 def get_auth_token():
     auth_url = f"{AIRFLOW_API_URL.replace('/api/v2', '')}/auth/token"
     response = requests.post(
@@ -325,7 +346,7 @@ def get_auth_token():
     return response.json()["access_token"]
 
 
-def extract_text_per_page(pdf_path, component=None, max_pages=None):
+def extract_text_per_page(pdf_path, component=None, max_pages=None, logger_callback=None):
     try:
         process_instance_dir = os.path.dirname(pdf_path)
         cached_page_texts = get_cached_page_texts(process_instance_dir, os.path.basename(pdf_path))
@@ -340,6 +361,7 @@ def extract_text_per_page(pdf_path, component=None, max_pages=None):
             process_instance_dir=process_instance_dir,
             ocr_engine=(component or {}).get("ocr_engine", "paddle"),
             config=_get_classification_ocr_config(component, last_page=max_pages or None),
+            logger_callback=logger_callback,
         )
         generated_page_texts = [page.get("cleaned_text") or page.get("text", "") for page in cache_payload.get("pages", [])]
         if generated_page_texts:
@@ -375,6 +397,7 @@ def classify_documents(**context):
     process_instance_dir_path = os.path.join(LOCAL_DOWNLOAD_DIR, f"process-instance-{process_instance_id}")
     os.makedirs(process_instance_dir_path, exist_ok=True)
     blueprint_path = os.path.join(process_instance_dir_path, "blueprint.json")
+    ocr_logger = build_ocr_logger(process_instance_id, "Classification")
 
     hook = MySqlHook(mysql_conn_id="idp_mysql")
     conn = hook.get_conn()
@@ -491,6 +514,7 @@ def classify_documents(**context):
                         threshold_embed=0.35,
                         threshold_tfidf=0.25,
                         max_pages=None,
+                        logger_callback=ocr_logger,
                     )
                     results[file_name] = classification
                     print(f"{file_name} -> {classification} (ML)")
@@ -505,7 +529,7 @@ def classify_documents(**context):
                 accumulated_text = ""
                 pages_scanned = 0
                 for page_number, page_text in enumerate(
-                    extract_text_per_page(file_path, component=classify_component, max_pages=None),
+                    extract_text_per_page(file_path, component=classify_component, max_pages=None, logger_callback=ocr_logger),
                     start=1,
                 ):
                     pages_scanned = page_number

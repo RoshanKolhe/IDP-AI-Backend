@@ -282,7 +282,7 @@ def extract_all_fields_from_page(doc_type, field_prompts, page_text):
     return parse_json_response(response.choices[0].message.content.strip())
 
 
-def ml_extract_text_from_pdf(pdf_path, max_pages=5):
+def ml_extract_text_from_pdf(pdf_path, max_pages=5, logger_callback=None):
     process_instance_dir = os.path.dirname(pdf_path)
     cached_text = get_cached_document_text(process_instance_dir, os.path.basename(pdf_path))
     if cached_text and cached_text.strip():
@@ -293,6 +293,7 @@ def ml_extract_text_from_pdf(pdf_path, max_pages=5):
         process_instance_dir=process_instance_dir,
         ocr_engine="paddle",
         config={"dpi": 300, "last_page": max_pages},
+        logger_callback=logger_callback,
     )
     cached_text = cache_payload.get("cleaned_text") or cache_payload.get("raw_text") or ""
     if cached_text.strip():
@@ -392,7 +393,26 @@ def log_to_mongo(process_instance_id, node_name, message, log_type=1, remark="")
         print(f"Failed to log to MongoDB: {mongo_err}")
 
 
-def extract_text_from_pdf(pdf_path):
+def build_ocr_logger(process_instance_id, node_name):
+    def _logger(level, message):
+        level_map = {
+            "info": 0,
+            "error": 1,
+            "success": 2,
+            "warning": 3,
+        }
+        print(message)
+        log_to_mongo(
+            process_instance_id,
+            node_name=node_name,
+            message=message,
+            log_type=level_map.get(level, 0),
+        )
+
+    return _logger
+
+
+def extract_text_from_pdf(pdf_path, logger_callback=None):
     process_instance_dir = os.path.dirname(pdf_path)
     cached_page_texts = get_cached_page_texts(process_instance_dir, os.path.basename(pdf_path))
     if cached_page_texts:
@@ -403,6 +423,7 @@ def extract_text_from_pdf(pdf_path):
         process_instance_dir=process_instance_dir,
         ocr_engine="paddle",
         config={"dpi": 300, "last_page": MAX_PAGES_TO_SCAN},
+        logger_callback=logger_callback,
     )
     generated_page_texts = [page.get("cleaned_text") or page.get("text", "") for page in cache_payload.get("pages", [])]
     if generated_page_texts:
@@ -460,6 +481,7 @@ def extract_fields_from_documents(**context):
     cleaned_fields_path = os.path.join(process_instance_dir_path, "cleaned_extracted_fields.json")
     classified_json_path = os.path.join(process_instance_dir_path, "classified_documents.json")
     blueprint_path = os.path.join(process_instance_dir_path, "blueprint.json")
+    ocr_logger = build_ocr_logger(process_instance_id, "Extraction")
 
     hook = MySqlHook(mysql_conn_id="idp_mysql")
     conn = hook.get_conn()
@@ -512,7 +534,7 @@ def extract_fields_from_documents(**context):
             if extractor_method == "ml":
                 try:
                     print(f"Using ML extractor for {file_name} ({doc_type})")
-                    ocr_text_full = ml_extract_text_from_pdf(doc_path, max_pages=MAX_PAGES_TO_SCAN)
+                    ocr_text_full = ml_extract_text_from_pdf(doc_path, max_pages=MAX_PAGES_TO_SCAN, logger_callback=ocr_logger)
                     print(f"ML OCR text length for {file_name}: {len(ocr_text_full)}")
                     log_to_mongo(
                         process_instance_id,
@@ -531,7 +553,7 @@ def extract_fields_from_documents(**context):
                     log_to_mongo(process_instance_id, message=f"ML extraction failed for {file_name}: {e}", node_name="Extraction", log_type=1)
             else:
                 print(f"Using GenAI extractor for {file_name} ({doc_type})")
-                page_texts = extract_text_from_pdf(doc_path)
+                page_texts = extract_text_from_pdf(doc_path, logger_callback=ocr_logger)
                 remaining_fields = {field["variableName"] for field in field_prompts}
 
                 for page_num, page_text in enumerate(page_texts, start=1):

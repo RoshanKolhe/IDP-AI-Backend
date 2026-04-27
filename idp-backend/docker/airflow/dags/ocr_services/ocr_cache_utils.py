@@ -33,6 +33,13 @@ def get_ocr_cache_path(process_instance_dir: str, pdf_filename: str) -> str:
     return os.path.join(get_ocr_output_dir(process_instance_dir), f"{base_filename}.json")
 
 
+def get_ocr_pages_dir(process_instance_dir: str, pdf_filename: str) -> str:
+    base_filename = os.path.splitext(os.path.basename(pdf_filename))[0]
+    pages_dir = os.path.join(get_ocr_output_dir(process_instance_dir), base_filename)
+    os.makedirs(pages_dir, exist_ok=True)
+    return pages_dir
+
+
 def enhance_image_for_ocr(image: Image.Image) -> Image.Image:
     rgb_image = image.convert("RGB")
     image_array = np.array(rgb_image)
@@ -82,6 +89,27 @@ def save_ocr_cache(cache_path: str, payload: Dict) -> None:
         json.dump(payload, file, indent=2, ensure_ascii=False)
 
 
+def save_page_outputs(process_instance_dir: str, pdf_filename: str, payload: Dict) -> None:
+    pages_dir = get_ocr_pages_dir(process_instance_dir, pdf_filename)
+
+    summary_path = os.path.join(pages_dir, "document.json")
+    with open(summary_path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, ensure_ascii=False)
+
+    for page in payload.get("pages", []):
+        page_number = int(page.get("page_number", 0))
+        page_base_name = f"page_{page_number:03d}"
+
+        with open(os.path.join(pages_dir, f"{page_base_name}.txt"), "w", encoding="utf-8") as file:
+            file.write(page.get("text", "") or "")
+
+        with open(os.path.join(pages_dir, f"{page_base_name}.cleaned.txt"), "w", encoding="utf-8") as file:
+            file.write(page.get("cleaned_text", "") or "")
+
+        with open(os.path.join(pages_dir, f"{page_base_name}.json"), "w", encoding="utf-8") as file:
+            json.dump(page, file, indent=2, ensure_ascii=False)
+
+
 def load_ocr_cache(cache_path: str) -> Optional[Dict]:
     if not os.path.exists(cache_path):
         return None
@@ -120,6 +148,8 @@ def ensure_ocr_cache(
     config: Optional[Dict] = None,
     cleanup_service=None,
     force_refresh: bool = False,
+    logger_callback=None,
+    fallback_ocr_engine: str = "tesseract",
 ) -> Dict:
     pdf_filename = os.path.basename(pdf_path)
     cache_path = get_ocr_cache_path(process_instance_dir, pdf_filename)
@@ -127,9 +157,18 @@ def ensure_ocr_cache(
     if not force_refresh:
         existing = load_ocr_cache(cache_path)
         if existing:
+            save_page_outputs(process_instance_dir, pdf_filename, existing)
+            if logger_callback:
+                logger_callback(
+                    "info",
+                    f"Using cached OCR for {pdf_filename}: pages={existing.get('page_count', 0)}",
+                )
             return existing
 
     ocr_service = get_ocr_service(ocr_engine)
+    fallback_service = None
+    if fallback_ocr_engine and fallback_ocr_engine != ocr_engine:
+        fallback_service = get_ocr_service(fallback_ocr_engine)
     config = config or {}
     convert_kwargs = {"dpi": config.get("dpi", 300)}
     if config.get("first_page") is not None:
@@ -150,10 +189,29 @@ def ensure_ocr_cache(
         )
 
         try:
+            if logger_callback:
+                logger_callback(
+                    "info",
+                    f"Scanning {pdf_filename} page {page_number}/{len(images)} with {ocr_engine}",
+                )
+
             enhanced_image.save(temp_image_path, format="PNG")
             page_conf = dict(config)
             page_result = ocr_service.extract_text_with_confidence(temp_image_path, page_conf)
             page_text = (page_result.get("text") or "").strip()
+
+            if not page_text and fallback_service:
+                fallback_result = fallback_service.extract_text_with_confidence(temp_image_path, page_conf)
+                fallback_text = (fallback_result.get("text") or "").strip()
+                if fallback_text:
+                    page_result = fallback_result
+                    page_text = fallback_text
+                    if logger_callback:
+                        logger_callback(
+                            "warning",
+                            f"{ocr_engine} returned empty OCR for {pdf_filename} page {page_number}; used {fallback_ocr_engine} fallback",
+                        )
+
             cleaned_page_text = page_text
             if cleanup_service and page_text:
                 try:
@@ -167,8 +225,15 @@ def ensure_ocr_cache(
                     "text": page_text,
                     "cleaned_text": cleaned_page_text,
                     "confidence": page_result.get("confidence", 0.0),
+                    "character_count": len(page_text),
                 }
             )
+
+            if logger_callback:
+                logger_callback(
+                    "success" if page_text else "warning",
+                    f"OCR finished for {pdf_filename} page {page_number}: chars={len(page_text)}, confidence={round(float(page_result.get('confidence', 0.0)), 2)}",
+                )
         finally:
             if os.path.exists(temp_image_path):
                 os.remove(temp_image_path)
@@ -184,4 +249,5 @@ def ensure_ocr_cache(
         config=config,
     )
     save_ocr_cache(cache_path, payload)
+    save_page_outputs(process_instance_dir, pdf_filename, payload)
     return payload

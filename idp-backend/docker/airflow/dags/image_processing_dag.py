@@ -129,6 +129,21 @@ def process_documents_with_ocr(**context):
     cursor = conn.cursor()
     
     try:
+        def page_logger(level, message):
+            level_map = {
+                "info": 0,
+                "error": 1,
+                "success": 2,
+                "warning": 3,
+            }
+            print(message)
+            log_to_mongo(
+                process_instance_id,
+                "ImageProcessing",
+                message,
+                log_type=level_map.get(level, 0)
+            )
+
         # Check if blueprint exists
         if not os.path.exists(blueprint_path):
             raise FileNotFoundError(
@@ -256,6 +271,8 @@ def process_documents_with_ocr(**context):
                     config=ocr_config,
                     cleanup_service=cleanup_service,
                     force_refresh=True,
+                    logger_callback=page_logger,
+                    fallback_ocr_engine="tesseract" if ocr_engine != "tesseract" else None,
                 )
                 extracted_text = cache_payload.get("cleaned_text") or cache_payload.get("raw_text") or ""
                 
@@ -268,6 +285,12 @@ def process_documents_with_ocr(**context):
                 print(f"✅ Extracted {len(extracted_text)} characters from {pdf_filename}")
                 
                 # Apply AI cleanup if enabled
+                log_to_mongo(
+                    process_instance_id,
+                    "ImageProcessing",
+                    f"OCR summary for {pdf_filename}: pages={cache_payload.get('page_count', 0)}, chars={len(extracted_text)}",
+                    log_type=2
+                )
                 final_text = extracted_text
                 # The cache helper already performs cleanup, so skip a second pass here.
                 if False and ai_cleanup and cleanup_service:

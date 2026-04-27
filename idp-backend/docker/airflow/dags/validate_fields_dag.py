@@ -47,7 +47,14 @@ def get_auth_token():
     response.raise_for_status()
     return response.json()["access_token"]
 
-def extract_text_from_pdf(pdf_path):
+def build_ocr_logger():
+    def _logger(level, message):
+        print(message)
+
+    return _logger
+
+
+def extract_text_from_pdf(pdf_path, logger_callback=None):
     process_instance_dir = os.path.dirname(pdf_path)
     cached_text = get_cached_document_text(process_instance_dir, os.path.basename(pdf_path))
     if cached_text and cached_text.strip():
@@ -58,6 +65,7 @@ def extract_text_from_pdf(pdf_path):
         process_instance_dir=process_instance_dir,
         ocr_engine="paddle",
         config={"dpi": 300},
+        logger_callback=logger_callback,
     )
     cached_text = cache_payload.get("cleaned_text") or cache_payload.get("raw_text") or ""
     if cached_text.strip():
@@ -115,7 +123,7 @@ def validate_extracted_fields(**context):
             print(f"❌ File missing: {file_name}")
             continue
 
-        ocr_text = extract_text_from_pdf(doc_path)
+        ocr_text = extract_text_from_pdf(doc_path, logger_callback=build_ocr_logger())
         score_sum = 0
         valid_fields = 0
         validated_fields = []

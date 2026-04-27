@@ -73,6 +73,25 @@ def log_to_mongo(process_instance_id, node_name, message, log_type=1, remark="")
     except Exception as mongo_err:
         print(f"⚠️ Failed to log to MongoDB: {mongo_err}")
 
+def build_ocr_logger(process_instance_id, node_name):
+    def _logger(level, message):
+        level_map = {
+            "info": 0,
+            "error": 1,
+            "success": 2,
+            "warning": 3,
+        }
+        print(message)
+        log_to_mongo(
+            process_instance_id,
+            node_name=node_name,
+            message=message,
+            log_type=level_map.get(level, 0),
+        )
+
+    return _logger
+
+
 def get_auth_token():
     auth_url = f"{AIRFLOW_API_URL.replace('/api/v2', '')}/auth/token"
     response = requests.post(
@@ -84,7 +103,7 @@ def get_auth_token():
     response.raise_for_status()
     return response.json()["access_token"]
 
-def extract_text_from_pdf(pdf_path):
+def extract_text_from_pdf(pdf_path, logger_callback=None):
     process_instance_dir = os.path.dirname(pdf_path)
     cached_text = get_cached_document_text(process_instance_dir, os.path.basename(pdf_path))
     if cached_text and cached_text.strip():
@@ -95,6 +114,7 @@ def extract_text_from_pdf(pdf_path):
         process_instance_dir=process_instance_dir,
         ocr_engine="paddle",
         config={"dpi": 300},
+        logger_callback=logger_callback,
     )
     cached_text = cache_payload.get("cleaned_text") or cache_payload.get("raw_text") or ""
     if cached_text.strip():
@@ -158,7 +178,7 @@ def highlight_and_upload(**context):
         if not os.path.exists(pdf_path):
             continue
 
-        ocr_text = extract_text_from_pdf(pdf_path)
+        ocr_text = extract_text_from_pdf(pdf_path, logger_callback=build_ocr_logger(process_instance_id, "Validation"))
         validated_fields, score_sum = [], 0
 
         for field in fields:
