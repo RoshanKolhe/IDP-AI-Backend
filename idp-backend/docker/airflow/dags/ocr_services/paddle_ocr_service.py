@@ -1,10 +1,10 @@
 """
-Enhanced Paddle OCR Service
-Preserves original logic + improves OCR quality
+PaddleOCR 3.5 Compatible OCR Service
 """
 
 from typing import Dict, Optional, List
 from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import cv2
 
@@ -15,7 +15,6 @@ from .base_ocr_service import BaseOCRService
 
 
 class PaddleOCRService(BaseOCRService):
-    """Enhanced PaddleOCR service implementation."""
 
     SUPPORTED_LANGUAGES = [
         "en",
@@ -31,14 +30,14 @@ class PaddleOCRService(BaseOCRService):
             from paddleocr import PaddleOCR
             self._engine_cls = PaddleOCR
         except Exception as exc:
-            raise RuntimeError(f"PaddleOCR not available: {exc}")
+            raise RuntimeError(f"PaddleOCR import failed: {exc}")
 
         self._ocr_engine = None
         self._engine_config = None
 
-    # -------------------------
-    # LANGUAGE HELPERS
-    # -------------------------
+    # --------------------------
+    # Language
+    # --------------------------
 
     def _normalize_language(self, language_mode: Optional[str]) -> str:
         if not language_mode or language_mode == "auto":
@@ -46,27 +45,27 @@ class PaddleOCRService(BaseOCRService):
 
         language_mode = language_mode.lower().strip()
 
-        language_map = {
+        mapping = {
             "eng": "en",
             "eng+hin": "en",
             "hin": "devanagari",
         }
 
-        return language_map.get(language_mode, language_mode)
+        return mapping.get(language_mode, language_mode)
 
-    # -------------------------
-    # ENGINE CACHE
-    # -------------------------
+    # --------------------------
+    # Engine
+    # --------------------------
 
-    def _get_engine(self, config: Optional[Dict] = None):
+    def _get_engine(self, config=None):
         config = config or {}
 
-        lang = self._normalize_language(config.get("language_mode"))
-        use_angle_cls = bool(config.get("use_angle_cls", True))
+        lang = self._normalize_language(
+            config.get("language_mode")
+        )
 
         engine_config = {
-            "use_angle_cls": use_angle_cls,
-            "lang": lang,
+            "lang": lang
         }
 
         if self._ocr_engine is None or self._engine_config != engine_config:
@@ -75,33 +74,33 @@ class PaddleOCRService(BaseOCRService):
 
         return self._ocr_engine
 
-    # -------------------------
-    # PDF CONFIG
-    # -------------------------
+    # --------------------------
+    # PDF
+    # --------------------------
 
-    def _get_pdf_convert_kwargs(self, config: Optional[Dict] = None) -> Dict:
+    def _get_pdf_convert_kwargs(self, config=None):
         config = config or {}
 
         kwargs = {
-            "dpi": config.get("dpi", 300),
+            "dpi": config.get("dpi", 300)
         }
 
-        if config.get("first_page") is not None:
+        if config.get("first_page"):
             kwargs["first_page"] = config["first_page"]
 
-        if config.get("last_page") is not None:
+        if config.get("last_page"):
             kwargs["last_page"] = config["last_page"]
 
-        if config.get("thread_count") is not None:
+        if config.get("thread_count"):
             kwargs["thread_count"] = config["thread_count"]
 
         return kwargs
 
-    # -------------------------
-    # IMAGE PREPROCESSING
-    # -------------------------
+    # --------------------------
+    # Preprocess
+    # --------------------------
 
-    def _preprocess_image(self, image: Image.Image) -> np.ndarray:
+    def _preprocess_image(self, image):
         img = np.array(image.convert("RGB"))
 
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
@@ -125,56 +124,40 @@ class PaddleOCRService(BaseOCRService):
             11
         )
 
-        final = cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB)
+        return cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB)
 
-        return final
+    # --------------------------
+    # Parse OCR Output
+    # --------------------------
 
-    # -------------------------
-    # OCR PAGE EXTRACTION
-    # -------------------------
-
-    def _extract_page_result(
-        self,
-        image: Image.Image,
-        config: Optional[Dict] = None
-    ) -> Dict:
-
-        config = config or {}
-
-        ocr_engine = self._get_engine(config)
-
-        processed = self._preprocess_image(image)
-
-        result = ocr_engine.ocr(
-            processed,
-            cls=bool(config.get("use_angle_cls", True))
-        )
-
-        lines = result[0] if result else []
-
+    def _parse_result(self, result):
         texts = []
         confidences = []
-        structured_lines = []
+        lines = []
 
-        for line in lines or []:
-            if not line or len(line) < 2:
-                continue
+        if not result:
+            return {
+                "text": "",
+                "confidence": 0.0,
+                "lines": []
+            }
 
-            box = line[0]
-            text = line[1][0] if len(line[1]) > 0 else ""
-            conf = float(line[1][1]) if len(line[1]) > 1 else 0.0
+        for block in result:
+            if isinstance(block, dict):
+                text = block.get("rec_text", "")
+                conf = float(block.get("rec_score", 0.0))
+                box = block.get("dt_polys", [])
 
-            if text:
-                texts.append(text)
-                confidences.append(conf)
+                if text:
+                    texts.append(text)
+                    confidences.append(conf)
 
-                structured_lines.append({
-                    "text": text,
-                    "confidence": conf,
-                    "box": box
-                })
+                    lines.append({
+                        "text": text,
+                        "confidence": conf,
+                        "box": box
+                    })
 
-        # weighted confidence by text length
         total_chars = sum(len(t) for t in texts) or 1
 
         weighted_conf = sum(
@@ -185,19 +168,27 @@ class PaddleOCRService(BaseOCRService):
         return {
             "text": "\n".join(texts),
             "confidence": weighted_conf,
-            "lines": structured_lines,
+            "lines": lines
         }
 
-    # -------------------------
-    # MAIN TEXT EXTRACTION
-    # -------------------------
+    # --------------------------
+    # OCR Single Page
+    # --------------------------
 
-    def extract_text(
-        self,
-        image_path: str,
-        config: Optional[Dict] = None
-    ) -> str:
+    def _extract_page_result(self, image, config=None):
+        engine = self._get_engine(config)
 
+        processed = self._preprocess_image(image)
+
+        result = engine.ocr(processed)
+
+        return self._parse_result(result)
+
+    # --------------------------
+    # Extract Text
+    # --------------------------
+
+    def extract_text(self, image_path, config=None):
         config = config or {}
 
         try:
@@ -208,11 +199,11 @@ class PaddleOCRService(BaseOCRService):
                     **self._get_pdf_convert_kwargs(config)
                 )
 
-                workers = config.get("workers", 4)
+                workers = 1
 
-                with ThreadPoolExecutor(max_workers=workers) as executor:
+                with ThreadPoolExecutor(max_workers=workers) as ex:
                     results = list(
-                        executor.map(
+                        ex.map(
                             lambda img: self._extract_page_result(img, config),
                             images
                         )
@@ -229,16 +220,11 @@ class PaddleOCRService(BaseOCRService):
         except Exception as exc:
             raise RuntimeError(f"OCR extraction failed: {exc}")
 
-    # -------------------------
-    # TEXT + CONFIDENCE
-    # -------------------------
+    # --------------------------
+    # Extract with Confidence
+    # --------------------------
 
-    def extract_text_with_confidence(
-        self,
-        image_path: str,
-        config: Optional[Dict] = None
-    ) -> Dict:
-
+    def extract_text_with_confidence(self, image_path, config=None):
         config = config or {}
 
         try:
@@ -249,15 +235,10 @@ class PaddleOCRService(BaseOCRService):
                     **self._get_pdf_convert_kwargs(config)
                 )
 
-                workers = config.get("workers", 4)
-
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    results = list(
-                        executor.map(
-                            lambda img: self._extract_page_result(img, config),
-                            images
-                        )
-                    )
+                results = [
+                    self._extract_page_result(img, config)
+                    for img in images
+                ]
 
                 text = "\n\n".join(
                     r["text"] for r in results if r["text"].strip()
@@ -271,11 +252,8 @@ class PaddleOCRService(BaseOCRService):
 
                 return {
                     "text": text,
-                    "confidence": (
-                        sum(confs) / len(confs)
-                        if confs else 0.0
-                    ),
-                    "pages": results,
+                    "confidence": sum(confs) / len(confs) if confs else 0.0,
+                    "pages": results
                 }
 
             image = Image.open(image_path)
@@ -285,17 +263,15 @@ class PaddleOCRService(BaseOCRService):
         except Exception as exc:
             raise RuntimeError(f"OCR extraction failed: {exc}")
 
-    # -------------------------
-    # LANGUAGE SUPPORT
-    # -------------------------
+    # --------------------------
+    # Language Support
+    # --------------------------
 
-    def supports_language(self, language_code: str) -> bool:
+    def supports_language(self, language_code):
         if not language_code or language_code == "auto":
             return True
 
-        normalized = self._normalize_language(language_code)
+        return self._normalize_language(language_code) in self.SUPPORTED_LANGUAGES
 
-        return normalized in self.SUPPORTED_LANGUAGES
-
-    def get_supported_languages(self) -> List[str]:
+    def get_supported_languages(self):
         return self.SUPPORTED_LANGUAGES
