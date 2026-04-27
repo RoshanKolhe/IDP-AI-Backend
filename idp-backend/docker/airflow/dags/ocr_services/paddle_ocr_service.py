@@ -194,28 +194,46 @@ class PaddleOCRService(BaseOCRService):
         try:
             if image_path.lower().endswith(".pdf"):
 
-                images = convert_from_path(
-                    image_path,
-                    **self._get_pdf_convert_kwargs(config)
-                )
+                from PyPDF2 import PdfReader
 
-                workers = 1
+                page_count = len(PdfReader(image_path).pages)
 
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    results = list(
-                        ex.map(
-                            lambda img: self._extract_page_result(img, config),
-                            images
-                        )
+                all_text = []
+
+                dpi = config.get("dpi", 150)
+
+                for page_no in range(1, page_count + 1):
+
+                    images = convert_from_path(
+                        image_path,
+                        dpi=dpi,
+                        first_page=page_no,
+                        last_page=page_no
                     )
 
-                return "\n\n".join(
-                    r["text"] for r in results if r["text"].strip()
-                )
+                    if not images:
+                        continue
+
+                    image = images[0]
+
+                    result = self._extract_page_result(image, config)
+
+                    if result["text"].strip():
+                        all_text.append(result["text"])
+
+                    image.close()
+                    del image
+                    del images
+
+                return "\n\n".join(all_text)
 
             image = Image.open(image_path)
 
-            return self._extract_page_result(image, config)["text"]
+            result = self._extract_page_result(image, config)
+
+            image.close()
+
+            return result["text"]
 
         except Exception as exc:
             raise RuntimeError(f"OCR extraction failed: {exc}")
@@ -230,35 +248,59 @@ class PaddleOCRService(BaseOCRService):
         try:
             if image_path.lower().endswith(".pdf"):
 
-                images = convert_from_path(
-                    image_path,
-                    **self._get_pdf_convert_kwargs(config)
-                )
+                from PyPDF2 import PdfReader
 
-                results = [
-                    self._extract_page_result(img, config)
-                    for img in images
-                ]
+                page_count = len(PdfReader(image_path).pages)
 
-                text = "\n\n".join(
-                    r["text"] for r in results if r["text"].strip()
-                )
+                dpi = config.get("dpi", 150)
+                max_pages = config.get("max_pages", page_count)
 
-                confs = [
-                    r["confidence"]
-                    for r in results
-                    if r["text"].strip()
-                ]
+                all_pages = []
+                texts = []
+                confs = []
+
+                for page_no in range(1, min(page_count, max_pages) + 1):
+
+                    images = convert_from_path(
+                        image_path,
+                        dpi=dpi,
+                        first_page=page_no,
+                        last_page=page_no
+                    )
+
+                    if not images:
+                        continue
+
+                    image = images[0]
+
+                    result = self._extract_page_result(image, config)
+
+                    all_pages.append(result)
+
+                    if result["text"].strip():
+                        texts.append(result["text"])
+                        confs.append(result["confidence"])
+
+                    image.close()
+                    del image
+                    del images
 
                 return {
-                    "text": text,
-                    "confidence": sum(confs) / len(confs) if confs else 0.0,
-                    "pages": results
+                    "text": "\n\n".join(texts),
+                    "confidence": (
+                        sum(confs) / len(confs)
+                        if confs else 0.0
+                    ),
+                    "pages": all_pages
                 }
 
             image = Image.open(image_path)
 
-            return self._extract_page_result(image, config)
+            result = self._extract_page_result(image, config)
+
+            image.close()
+
+            return result
 
         except Exception as exc:
             raise RuntimeError(f"OCR extraction failed: {exc}")
