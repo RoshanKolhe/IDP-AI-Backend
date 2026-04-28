@@ -37,5 +37,3 @@ RUN pip install --no-cache-dir \
     scikit-learn==1.4.2 \
     scikit-image==0.22.0 \
     opencv-python-headless==4.8.1.78
-
-RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='en')"
