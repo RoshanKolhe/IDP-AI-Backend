@@ -260,7 +260,7 @@ def highlight_and_upload(**context):
             ]
 
             for field in validated_fields:
-                val_words = re.findall(r'[a-z0-9]+', field["fieldValue"].lower())
+                val_words = re.findall(r'[a-z0-9]+', str(field["fieldValue"]).lower())
                 for i in range(len(text_blocks) - len(val_words) + 1):
                     if all(val_words[j] == text_blocks[i + j]["text"] for j in range(len(val_words))):
                         x = text_blocks[i]["left"]
