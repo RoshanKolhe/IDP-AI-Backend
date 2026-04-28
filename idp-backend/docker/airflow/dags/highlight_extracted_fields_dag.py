@@ -186,7 +186,7 @@ def highlight_and_upload(**context):
             field_name = field.get("fieldName", "")
             value = field.get("fieldValue", "")
 
-            if value.strip().upper() == "N/A":
+            if str(value).strip().upper() == "N/A":
                 continue
             prompt = f"""
             You are validating extracted data from a scanned document.
