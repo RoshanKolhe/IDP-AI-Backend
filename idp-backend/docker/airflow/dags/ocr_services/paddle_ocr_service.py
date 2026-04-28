@@ -1,15 +1,25 @@
 """
-PaddleOCR 3.5 Compatible OCR Service
+Enterprise PaddleOCR Service (CPU Optimized)
+Designed for:
+- Bad quality scans
+- Government docs
+- Agreements
+- Large PDFs (100+ pages)
+- 8 Core CPU / 32GB RAM
 """
 
-from typing import Dict, Optional, List
-from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Dict, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+import gc
+import os
 
 import numpy as np
 import cv2
 
 from pdf2image import convert_from_path
 from PIL import Image
+from PyPDF2 import PdfReader
 
 from .base_ocr_service import BaseOCRService
 
@@ -35,15 +45,13 @@ class PaddleOCRService(BaseOCRService):
         self._ocr_engine = None
         self._engine_config = None
 
-    # --------------------------
+    # ======================================================
     # Language
-    # --------------------------
+    # ======================================================
 
     def _normalize_language(self, language_mode: Optional[str]) -> str:
         if not language_mode or language_mode == "auto":
             return "en"
-
-        language_mode = language_mode.lower().strip()
 
         mapping = {
             "eng": "en",
@@ -51,24 +59,23 @@ class PaddleOCRService(BaseOCRService):
             "hin": "devanagari",
         }
 
-        return mapping.get(language_mode, language_mode)
+        return mapping.get(language_mode.lower().strip(), "en")
 
-    # --------------------------
+    # ======================================================
     # Engine
-    # --------------------------
+    # ======================================================
 
     def _get_engine(self, config=None):
         config = config or {}
 
-        lang = self._normalize_language(
-            config.get("language_mode")
-        )
+        lang = self._normalize_language(config.get("language_mode"))
 
         engine_config = {
             "lang": lang,
             "use_angle_cls": True,
             "show_log": False,
             "use_gpu": False,
+            "cpu_threads": 4,
         }
 
         if self._ocr_engine is None or self._engine_config != engine_config:
@@ -77,96 +84,135 @@ class PaddleOCRService(BaseOCRService):
 
         return self._ocr_engine
 
-    # --------------------------
-    # PDF
-    # --------------------------
+    # ======================================================
+    # Quality Detection
+    # ======================================================
 
-    def _get_pdf_convert_kwargs(self, config=None):
-        config = config or {}
+    def _is_low_quality(self, gray):
+        blur = cv2.Laplacian(gray, cv2.CV_64F).var()
+        mean = np.mean(gray)
 
-        kwargs = {
-            "dpi": config.get("dpi", 300)
-        }
+        if blur < 60 or mean < 100:
+            return True
 
-        if config.get("first_page"):
-            kwargs["first_page"] = config["first_page"]
+        return False
 
-        if config.get("last_page"):
-            kwargs["last_page"] = config["last_page"]
+    # ======================================================
+    # Deskew
+    # ======================================================
 
-        if config.get("thread_count"):
-            kwargs["thread_count"] = config["thread_count"]
+    def _deskew(self, gray):
+        coords = np.column_stack(np.where(gray < 200))
+        if len(coords) == 0:
+            return gray
 
-        return kwargs
+        angle = cv2.minAreaRect(coords)[-1]
 
-    # --------------------------
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+
+        h, w = gray.shape[:2]
+        center = (w // 2, h // 2)
+
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+        rotated = cv2.warpAffine(
+            gray,
+            M,
+            (w, h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE
+        )
+
+        return rotated
+
+    # ======================================================
     # Preprocess
-    # --------------------------
+    # ======================================================
 
     def _preprocess_image(self, image):
         img = np.array(image.convert("RGB"))
-
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+        low_quality = self._is_low_quality(gray)
 
         gray = cv2.fastNlMeansDenoising(gray)
 
-        gray = cv2.resize(
-            gray,
-            None,
-            fx=2,
-            fy=2,
-            interpolation=cv2.INTER_CUBIC
-        )
+        if low_quality:
+            gray = cv2.resize(
+                gray, None, fx=2, fy=2,
+                interpolation=cv2.INTER_CUBIC
+            )
 
-        thresh = cv2.adaptiveThreshold(
+        # CLAHE
+        clahe = cv2.createCLAHE(
+            clipLimit=3.0,
+            tileGridSize=(8, 8)
+        )
+        gray = clahe.apply(gray)
+
+        # Deskew
+        gray = self._deskew(gray)
+
+        # Threshold
+        gray = cv2.adaptiveThreshold(
             gray,
             255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
             31,
-            11
+            10
         )
 
-        return cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB)
+        # Morph cleanup
+        kernel = np.ones((1, 1), np.uint8)
+        gray = cv2.morphologyEx(
+            gray,
+            cv2.MORPH_OPEN,
+            kernel
+        )
 
-    # --------------------------
-    # Parse OCR Output
-    # --------------------------
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+
+    # ======================================================
+    # Parse Result
+    # ======================================================
 
     def _parse_result(self, result):
-        texts = []
-        confidences = []
-        lines = []
-
         if not result or not result[0]:
-            return {"text": "", "confidence": 0.0, "lines": []}
+            return {
+                "text": "",
+                "confidence": 0.0
+            }
 
-        for line in result[0]:
-            box = line[0]
-            text = line[1][0]
-            conf = float(line[1][1])
+        lines = []
+        confidences = []
 
-            texts.append(text)
-            confidences.append(conf)
+        for item in result[0]:
+            text = item[1][0].strip()
+            conf = float(item[1][1])
 
-            lines.append({
-                "text": text,
-                "confidence": conf,
-                "box": box
-            })
+            if text:
+                lines.append(text)
+                confidences.append(conf)
 
-        total_chars = sum(len(t) for t in texts) or 1
-        weighted = sum(len(texts[i]) * confidences[i] for i in range(len(texts))) / total_chars
+        text = "\n".join(lines)
+
+        avg_conf = (
+            sum(confidences) / len(confidences)
+            if confidences else 0.0
+        )
 
         return {
-            "text": "\n".join(texts),
-            "confidence": weighted,
-            "lines": lines
+            "text": text,
+            "confidence": avg_conf
         }
 
-    # --------------------------
+    # ======================================================
     # OCR Single Page
-    # --------------------------
+    # ======================================================
 
     def _extract_page_result(self, image, config=None):
         engine = self._get_engine(config)
@@ -175,11 +221,51 @@ class PaddleOCRService(BaseOCRService):
 
         result = engine.ocr(processed)
 
-        return self._parse_result(result)
+        parsed = self._parse_result(result)
 
-    # --------------------------
+        # Retry if low confidence
+        if parsed["confidence"] < 0.70:
+            retry = engine.ocr(np.array(image.convert("RGB")))
+            retry_parsed = self._parse_result(retry)
+
+            if retry_parsed["confidence"] > parsed["confidence"]:
+                parsed = retry_parsed
+
+        return parsed
+
+    # ======================================================
+    # Process Single PDF Page
+    # ======================================================
+
+    def _process_pdf_page(self, image_path, page_no, dpi, config):
+        try:
+            images = convert_from_path(
+                image_path,
+                dpi=dpi,
+                first_page=page_no,
+                last_page=page_no
+            )
+
+            if not images:
+                return page_no, ""
+
+            image = images[0]
+
+            result = self._extract_page_result(image, config)
+
+            image.close()
+            del image
+            del images
+            gc.collect()
+
+            return page_no, result["text"]
+
+        except Exception:
+            return page_no, ""
+
+    # ======================================================
     # Extract Text
-    # --------------------------
+    # ======================================================
 
     def extract_text(self, image_path, config=None):
         config = config or {}
@@ -187,120 +273,192 @@ class PaddleOCRService(BaseOCRService):
         try:
             if image_path.lower().endswith(".pdf"):
 
-                from PyPDF2 import PdfReader
-
                 page_count = len(PdfReader(image_path).pages)
 
-                all_text = []
+                dpi = config.get("dpi", 300)
 
-                dpi = config.get("dpi", 150)
+                workers = config.get("workers", 4)
 
-                for page_no in range(1, page_count + 1):
+                results = {}
 
-                    images = convert_from_path(
-                        image_path,
-                        dpi=dpi,
-                        first_page=page_no,
-                        last_page=page_no
-                    )
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = []
 
-                    if not images:
-                        continue
+                    for page_no in range(1, page_count + 1):
+                        futures.append(
+                            executor.submit(
+                                self._process_pdf_page,
+                                image_path,
+                                page_no,
+                                dpi,
+                                config
+                            )
+                        )
 
-                    image = images[0]
+                    for future in as_completed(futures):
+                        page_no, text = future.result()
+                        results[page_no] = text
 
-                    result = self._extract_page_result(image, config)
+                final_text = []
 
-                    if result["text"].strip():
-                        all_text.append(result["text"])
+                for page_no in sorted(results.keys()):
+                    if results[page_no].strip():
+                        final_text.append(results[page_no])
 
-                    image.close()
-                    del image
-                    del images
+                return "\n\n".join(final_text)
 
-                return "\n\n".join(all_text)
-
+            # Image OCR
             image = Image.open(image_path)
-
             result = self._extract_page_result(image, config)
-
             image.close()
 
             return result["text"]
 
         except Exception as exc:
             raise RuntimeError(f"OCR extraction failed: {exc}")
-
-    # --------------------------
-    # Extract with Confidence
-    # --------------------------
+        
 
     def extract_text_with_confidence(self, image_path, config=None):
         config = config or {}
 
         try:
+            # ==========================================
+            # PDF OCR
+            # ==========================================
             if image_path.lower().endswith(".pdf"):
-
-                from PyPDF2 import PdfReader
 
                 page_count = len(PdfReader(image_path).pages)
 
-                dpi = config.get("dpi", 150)
-                max_pages = config.get("max_pages", page_count)
+                dpi = config.get("dpi", 300)
+                workers = config.get("workers", 4)
 
-                all_pages = []
+                results = {}
+
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = []
+
+                    for page_no in range(1, page_count + 1):
+                        futures.append(
+                            executor.submit(
+                                self._process_pdf_page_with_confidence,
+                                image_path,
+                                page_no,
+                                dpi,
+                                config
+                            )
+                        )
+
+                    for future in as_completed(futures):
+                        page_no, page_result = future.result()
+                        results[page_no] = page_result
+
+                pages = []
                 texts = []
                 confs = []
 
-                for page_no in range(1, min(page_count, max_pages) + 1):
+                for page_no in sorted(results.keys()):
+                    page_data = results[page_no]
 
-                    images = convert_from_path(
-                        image_path,
-                        dpi=dpi,
-                        first_page=page_no,
-                        last_page=page_no
-                    )
+                    pages.append({
+                        "page": page_no,
+                        "text": page_data["text"],
+                        "confidence": page_data["confidence"]
+                    })
 
-                    if not images:
-                        continue
+                    if page_data["text"].strip():
+                        texts.append(page_data["text"])
+                        confs.append(page_data["confidence"])
 
-                    image = images[0]
-
-                    result = self._extract_page_result(image, config)
-
-                    all_pages.append(result)
-
-                    if result["text"].strip():
-                        texts.append(result["text"])
-                        confs.append(result["confidence"])
-
-                    image.close()
-                    del image
-                    del images
+                final_conf = (
+                    sum(confs) / len(confs)
+                    if confs else 0.0
+                )
 
                 return {
                     "text": "\n\n".join(texts),
-                    "confidence": (
-                        sum(confs) / len(confs)
-                        if confs else 0.0
-                    ),
-                    "pages": all_pages
+                    "confidence": round(final_conf, 4),
+                    "total_pages": page_count,
+                    "processed_pages": len(pages),
+                    "pages": pages
                 }
 
+            # ==========================================
+            # IMAGE OCR
+            # ==========================================
             image = Image.open(image_path)
 
             result = self._extract_page_result(image, config)
 
             image.close()
 
-            return result
+            return {
+                "text": result["text"],
+                "confidence": round(result["confidence"], 4),
+                "total_pages": 1,
+                "processed_pages": 1,
+                "pages": [
+                    {
+                        "page": 1,
+                        "text": result["text"],
+                        "confidence": round(result["confidence"], 4)
+                    }
+                ]
+            }
 
         except Exception as exc:
             raise RuntimeError(f"OCR extraction failed: {exc}")
 
-    # --------------------------
-    # Language Support
-    # --------------------------
+
+    # =====================================================
+    # ADD THIS ALSO INSIDE SAME CLASS
+    # Process PDF Page with Confidence
+    # =====================================================
+
+    def _process_pdf_page_with_confidence(
+        self,
+        image_path,
+        page_no,
+        dpi,
+        config
+    ):
+        try:
+            images = convert_from_path(
+                image_path,
+                dpi=dpi,
+                first_page=page_no,
+                last_page=page_no
+            )
+
+            if not images:
+                return page_no, {
+                    "text": "",
+                    "confidence": 0.0
+                }
+
+            image = images[0]
+
+            result = self._extract_page_result(image, config)
+
+            image.close()
+
+            del image
+            del images
+            gc.collect()
+
+            return page_no, {
+                "text": result["text"],
+                "confidence": round(result["confidence"], 4)
+            }
+
+        except Exception:
+            return page_no, {
+                "text": "",
+                "confidence": 0.0
+            }
+
+    # ======================================================
+    # Support Language
+    # ======================================================
 
     def supports_language(self, language_code):
         if not language_code or language_code == "auto":
