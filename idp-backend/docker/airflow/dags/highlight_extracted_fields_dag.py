@@ -256,7 +256,7 @@ def highlight_and_upload(**context):
                     "width": ocr_data["width"][i],
                     "height": ocr_data["height"][i]
                 }
-                for i in range(len(ocr_data["text"])) if ocr_data["text"][i].strip() and int(ocr_data["conf"][i]) > 60
+                for i in range(len(ocr_data["text"])) if str(ocr_data["text"][i]).strip() and int(ocr_data["conf"][i]) > 60
             ]
 
             for field in validated_fields:
