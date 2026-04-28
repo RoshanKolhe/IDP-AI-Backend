@@ -316,6 +316,8 @@ def highlight_and_upload(**context):
                 and int(ocr_data["conf"][i]) > 45
             ]
 
+            text_blocks.sort(key=lambda x: (x["top"], x["left"]))
+
             for field in validated_fields:
 
                 target_page = field.get("pageNumber")
@@ -333,35 +335,43 @@ def highlight_and_upload(**context):
                 if not field_value:
                     continue
 
-                best_match = None
+                best_match_blocks = None
                 best_score = 0
 
-                for block in text_blocks:
+                for i in range(len(text_blocks)):
 
-                    block_text = re.sub(r'[^a-z0-9]', '', block["text"])
+                    for size in range(1, 6):   # combine 1 to 4 nearby blocks
 
-                    score = fuzzy_ratio(
-                        field_value,
-                        block_text
-                    )
+                        group = text_blocks[i:i+size]
 
-                    # substring boost
-                    if block["text"] in field_value or field_value in block["text"]:
-                        score += 20
+                        if not group:
+                            continue
 
-                    if score > best_score:
-                        best_score = score
-                        best_match = block
+                        combined_text = ''.join(
+                            re.sub(r'[^a-z0-9]', '', b["text"])
+                            for b in group
+                        )
 
-                if best_match and best_score >= 58:
+                        score = fuzzy_ratio(field_value, combined_text)
 
-                    x = best_match["left"]
-                    y = best_match["top"]
-                    x_end = x + best_match["width"]
-                    y_end = y + best_match["height"]
+                        # substring boost
+                        if combined_text in field_value or field_value in combined_text:
+                            score += 20
+
+                        if score > best_score:
+                            best_score = score
+                            best_match_blocks = group
+
+                if best_match_blocks and best_score >= 58:
+
+                    x1 = min(b["left"] for b in best_match_blocks)
+                    y1 = min(b["top"] for b in best_match_blocks)
+
+                    x2 = max(b["left"] + b["width"] for b in best_match_blocks)
+                    y2 = max(b["top"] + b["height"] for b in best_match_blocks)
 
                     draw_overlay.rectangle(
-                        [(x, y), (x_end, y_end)],
+                        [(x1, y1), (x2, y2)],
                         fill=(255, 255, 102, 100),
                         outline=(255, 204, 0, 200)
                     )
