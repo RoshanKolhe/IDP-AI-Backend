@@ -14,6 +14,7 @@ from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 import re
+import threading
 
 import numpy as np
 import cv2
@@ -45,6 +46,8 @@ class PaddleOCRService(BaseOCRService):
 
         self._ocr_engine = None
         self._engine_config = None
+        self._engine_lock = threading.Lock()
+        self._ocr_call_lock = threading.Lock()
 
     # =====================================================
     # LANGUAGE
@@ -81,9 +84,13 @@ class PaddleOCRService(BaseOCRService):
             "cpu_threads": 2,
         }
 
+        # PaddleOCR init is expensive and not thread-safe during first bootstrap.
+        # Guard initialization to avoid duplicate model downloads and memory corruption.
         if self._ocr_engine is None or self._engine_config != engine_config:
-            self._ocr_engine = self._engine_cls(**engine_config)
-            self._engine_config = engine_config
+            with self._engine_lock:
+                if self._ocr_engine is None or self._engine_config != engine_config:
+                    self._ocr_engine = self._engine_cls(**engine_config)
+                    self._engine_config = engine_config
 
         return self._ocr_engine
 
@@ -337,7 +344,10 @@ class PaddleOCRService(BaseOCRService):
 
         for variant in variants:
             try:
-                result = engine.ocr(variant)
+                # Guard native Paddle inference call; concurrent invocations can
+                # crash with allocator corruption in some environments.
+                with self._ocr_call_lock:
+                    result = engine.ocr(variant)
                 parsed = self._parse_result(result)
 
                 score = self._score_text(parsed)
